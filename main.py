@@ -48,25 +48,35 @@ DYNAMIC_NETWORK_IDLE = env_bool("DYNAMIC_NETWORK_IDLE", True)
 DYNAMIC_DISABLE_RESOURCES = env_bool("DYNAMIC_DISABLE_RESOURCES", False)
 
 AUTO_MIN_HTML_LENGTH = env_int("AUTO_MIN_HTML_LENGTH", 1000)
+AUTO_EXPAND_DEFAULT = env_bool("AUTO_EXPAND_DEFAULT", True)
+AUTO_EXPAND_WAIT_TIMEOUT = env_int("AUTO_EXPAND_WAIT_TIMEOUT", 15000)
+AUTO_EXPAND_AFTER_CLICK_WAIT = env_int("AUTO_EXPAND_AFTER_CLICK_WAIT", 1000)
 MAX_CLICK_SELECTORS = env_int("MAX_CLICK_SELECTORS", 20)
 MAX_CLICKS_PER_SELECTOR = env_int("MAX_CLICKS_PER_SELECTOR", 20)
 
-AUTO_EXPAND_SELECTOR = (
+DEFAULT_AUTO_EXPAND_SELECTOR = (
     "main button[aria-expanded='false'], "
     "main [role='button'][aria-expanded='false'], "
     "article button[aria-expanded='false'], "
     "article [role='button'][aria-expanded='false']"
 )
 
+AUTO_EXPAND_SELECTOR = os.getenv(
+    "AUTO_EXPAND_SELECTOR",
+    DEFAULT_AUTO_EXPAND_SELECTOR,
+)
+
+DEFAULT_AUTO_EXPAND_KEYWORDS = (
+    "applies to|details|expand|load more|read more|see more|show more|view more"
+)
+
 AUTO_EXPAND_KEYWORDS = [
-    "applies to",
-    "details",
-    "expand",
-    "load more",
-    "read more",
-    "see more",
-    "show more",
-    "view more",
+    keyword.strip().lower()
+    for keyword in os.getenv(
+        "AUTO_EXPAND_KEYWORDS",
+        DEFAULT_AUTO_EXPAND_KEYWORDS,
+    ).split("|")
+    if keyword.strip()
 ]
 
 DEFAULT_JS_SIGNALS = [
@@ -93,7 +103,7 @@ class ScrapeRequest(BaseModel):
     url: HttpUrl
     mode: str = "auto"  # auto / static / dynamic
     response_format: str = "json"  # json / markdown
-    auto_expand: bool = True
+    auto_expand: bool = AUTO_EXPAND_DEFAULT
     click_selectors: list[str] = Field(default_factory=list)
 
 
@@ -132,7 +142,7 @@ async def expand_common_content(page) -> int:
     try:
         await page.locator(AUTO_EXPAND_SELECTOR).first.wait_for(
             state="visible",
-            timeout=15000,
+            timeout=AUTO_EXPAND_WAIT_TIMEOUT,
         )
     except Exception:
         return clicked
@@ -165,7 +175,7 @@ async def fetch_dynamic(url: str, auto_expand: bool, click_selectors: list[str])
             clicked += await click_visible_elements(page, selector)
 
         if clicked:
-            await page.wait_for_timeout(1000)
+            await page.wait_for_timeout(AUTO_EXPAND_AFTER_CLICK_WAIT)
 
     page = await DynamicFetcher.async_fetch(
         url,
@@ -215,10 +225,10 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
             detail=f"Too many click_selectors; maximum is {MAX_CLICK_SELECTORS}",
         )
 
-    if mode == "static" and (req.auto_expand or click_selectors):
+    if mode == "static" and click_selectors:
         raise HTTPException(
             status_code=400,
-            detail="auto_expand and click_selectors require auto or dynamic mode",
+            detail="click_selectors require auto or dynamic mode",
         )
 
     try:
