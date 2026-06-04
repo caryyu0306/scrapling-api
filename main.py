@@ -3,7 +3,7 @@ import os
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import PlainTextResponse
 from markdownify import markdownify as md
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl
 from scrapling.fetchers import AsyncFetcher, DynamicFetcher
 
 app = FastAPI()
@@ -48,6 +48,26 @@ DYNAMIC_NETWORK_IDLE = env_bool("DYNAMIC_NETWORK_IDLE", True)
 DYNAMIC_DISABLE_RESOURCES = env_bool("DYNAMIC_DISABLE_RESOURCES", False)
 
 AUTO_MIN_HTML_LENGTH = env_int("AUTO_MIN_HTML_LENGTH", 1000)
+MAX_CLICK_SELECTORS = env_int("MAX_CLICK_SELECTORS", 20)
+MAX_CLICKS_PER_SELECTOR = env_int("MAX_CLICKS_PER_SELECTOR", 20)
+
+AUTO_EXPAND_SELECTOR = (
+    "main button[aria-expanded='false'], "
+    "main [role='button'][aria-expanded='false'], "
+    "article button[aria-expanded='false'], "
+    "article [role='button'][aria-expanded='false']"
+)
+
+AUTO_EXPAND_KEYWORDS = [
+    "applies to",
+    "details",
+    "expand",
+    "load more",
+    "read more",
+    "see more",
+    "show more",
+    "view more",
+]
 
 DEFAULT_JS_SIGNALS = [
     "doesn't work properly without javascript",
@@ -73,6 +93,8 @@ class ScrapeRequest(BaseModel):
     url: HttpUrl
     mode: str = "auto"  # auto / static / dynamic
     response_format: str = "json"  # json / markdown
+    auto_expand: bool = True
+    click_selectors: list[str] = Field(default_factory=list)
 
 
 @app.get("/health")
@@ -92,7 +114,59 @@ async def fetch_static(url: str):
     return page.status, html, "static"
 
 
-async def fetch_dynamic(url: str):
+async def click_visible_elements(page, selector: str) -> int:
+    clicked = 0
+    elements = await page.locator(selector).all()
+
+    for element in elements[:MAX_CLICKS_PER_SELECTOR]:
+        if await element.is_visible():
+            await element.click()
+            clicked += 1
+
+    return clicked
+
+
+async def expand_common_content(page) -> int:
+    clicked = await click_visible_elements(page, "main details:not([open]) > summary")
+
+    try:
+        await page.locator(AUTO_EXPAND_SELECTOR).first.wait_for(
+            state="visible",
+            timeout=15000,
+        )
+    except Exception:
+        return clicked
+
+    elements = await page.locator(AUTO_EXPAND_SELECTOR).all()
+
+    for element in elements[:MAX_CLICKS_PER_SELECTOR]:
+        if not await element.is_visible():
+            continue
+
+        text = (await element.inner_text()).strip().lower()
+        aria_label = (await element.get_attribute("aria-label") or "").strip().lower()
+        label = f"{text} {aria_label}"
+
+        if any(keyword in label for keyword in AUTO_EXPAND_KEYWORDS):
+            await element.click()
+            clicked += 1
+
+    return clicked
+
+
+async def fetch_dynamic(url: str, auto_expand: bool, click_selectors: list[str]):
+    async def interact_with_page(page):
+        clicked = 0
+
+        if auto_expand:
+            clicked += await expand_common_content(page)
+
+        for selector in click_selectors:
+            clicked += await click_visible_elements(page, selector)
+
+        if clicked:
+            await page.wait_for_timeout(1000)
+
     page = await DynamicFetcher.async_fetch(
         url,
         headless=True,
@@ -100,6 +174,7 @@ async def fetch_dynamic(url: str):
         network_idle=DYNAMIC_NETWORK_IDLE,
         wait=DYNAMIC_WAIT,
         disable_resources=DYNAMIC_DISABLE_RESOURCES,
+        page_action=interact_with_page,
     )
 
     html = page.body.decode("utf-8", errors="ignore")
@@ -126,6 +201,7 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
     url = str(req.url)
     mode = req.mode.lower()
     response_format = req.response_format.lower()
+    click_selectors = [selector.strip() for selector in req.click_selectors if selector.strip()]
 
     if mode not in {"auto", "static", "dynamic"}:
         raise HTTPException(status_code=400, detail="Invalid mode")
@@ -133,14 +209,34 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
     if response_format not in {"json", "markdown"}:
         raise HTTPException(status_code=400, detail="Invalid response_format")
 
+    if len(click_selectors) > MAX_CLICK_SELECTORS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many click_selectors; maximum is {MAX_CLICK_SELECTORS}",
+        )
+
+    if mode == "static" and (req.auto_expand or click_selectors):
+        raise HTTPException(
+            status_code=400,
+            detail="auto_expand and click_selectors require auto or dynamic mode",
+        )
+
     try:
         if mode == "dynamic":
-            status, html, used_mode = await fetch_dynamic(url)
+            status, html, used_mode = await fetch_dynamic(
+                url,
+                req.auto_expand,
+                click_selectors,
+            )
         else:
             status, html, used_mode = await fetch_static(url)
 
-            if mode == "auto" and should_use_dynamic(html):
-                status, html, used_mode = await fetch_dynamic(url)
+            if mode == "auto" and (should_use_dynamic(html) or click_selectors):
+                status, html, used_mode = await fetch_dynamic(
+                    url,
+                    req.auto_expand,
+                    click_selectors,
+                )
 
         markdown = md(html)
 
