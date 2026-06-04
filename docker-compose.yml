@@ -1,0 +1,9 @@
+services:
+  scrapling-api:
+    build: .
+    container_name: scrapling-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"

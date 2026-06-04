@@ -1,0 +1,61 @@
+import os
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel, HttpUrl
+from scrapling.fetchers import AsyncFetcher, DynamicFetcher
+from markdownify import markdownify as md
+
+app = FastAPI()
+API_KEY = os.getenv("API_KEY", "123456")
+
+class ScrapeRequest(BaseModel):
+    url: HttpUrl
+    mode: str = "auto"
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+async def fetch_static(url: str):
+    page = await AsyncFetcher.get(url, timeout=20, retries=2)
+    html = page.body.decode("utf-8", errors="ignore")
+    return page.status, html, "static"
+
+async def fetch_dynamic(url: str):
+    page = await DynamicFetcher.async_fetch(
+        url,
+        headless=True,
+        timeout=30000,
+        network_idle=True,
+        wait=2000,
+        disable_resources=True,
+    )
+    html = page.body.decode("utf-8", errors="ignore")
+    return page.status, html, "dynamic"
+
+@app.post("/scrape")
+async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    url = str(req.url)
+
+    if req.mode == "dynamic":
+        status, html, used_mode = await fetch_dynamic(url)
+    else:
+        status, html, used_mode = await fetch_static(url)
+
+        need_js = "doesn't work properly without JavaScript" in html
+        too_short = len(html.strip()) < 1000
+
+        if req.mode == "auto" and (need_js or too_short):
+            status, html, used_mode = await fetch_dynamic(url)
+
+    markdown = md(html)
+
+    return {
+        "success": True,
+        "url": url,
+        "status": status,
+        "mode": used_mode,
+        "markdown": markdown
+    }
