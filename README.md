@@ -22,16 +22,13 @@
 - [API 使用方式](#api-使用方式)
 - [抓取模式](#抓取模式)
 - [Auto 模式判斷方式](#auto-模式判斷方式)
-- [n8n 整合](#n8n-整合)
-- [Cloudflared 反向代理](#cloudflared-反向代理)
 - [容器維護](#容器維護)
 - [常見問題](#常見問題)
-- [安全建議](#安全建議)
 
 ## 運作流程
 
 ```text
-Client / n8n
+Client 
     |
     | POST /scrape
     | x-api-key: YOUR_API_KEY
@@ -344,53 +341,6 @@ EXTRA_JS_SIGNALS=javascript required|please turn on javascript|app loading faile
 2. 適度提高 `AUTO_MIN_HTML_LENGTH`
 3. 呼叫 API 時直接指定 `"mode":"dynamic"`
 
-## n8n 整合
-
-在 n8n 的 HTTP Request 節點中使用以下設定：
-
-- **Method**：`POST`
-- **URL**：`https://your-domain.example/scrape`
-- **Header**：`x-api-key` = 你的 API Key
-- **Body Content Type**：JSON
-- **Response Format**：Text
-- **Timeout**：`90000` 或 `120000`
-
-Body：
-
-```json
-{
-  "url": "={{ (($json.body && $json.body.url) || $json.url || '').trim() }}",
-  "mode": "auto",
-  "response_format": "markdown"
-}
-```
-
-動態抓取可能需要 60 秒以上。若 n8n 使用預設的 30 秒逾時，可能出現：
-
-```text
-timeout of 30000ms exceeded
-```
-
-## Cloudflared 反向代理
-
-使用 Cloudflared 前，先確認本機 API 正常：
-
-```bash
-curl http://localhost:8080/health
-```
-
-再確認公開網域：
-
-```bash
-curl https://your-domain.example/health
-```
-
-判斷方式：
-
-- 本機與網域都成功：API 與 Cloudflared 均正常
-- 本機成功、網域失敗：檢查 Cloudflared route、容器網路或反向代理設定
-- 本機失敗：先檢查容器狀態與應用程式日誌
-
 ## 容器維護
 
 ### 查看狀態
@@ -534,18 +484,4 @@ DYNAMIC_WAIT=5000
 DYNAMIC_TIMEOUT=90000
 ```
 
-## 安全建議
 
-- 使用長度足夠的隨機 API Key
-- 不要將正式 `.env` 提交到 GitHub
-- 建議將 `.env` 加入 `.gitignore`
-- 若公開到網際網路，建議搭配 Cloudflare Access、IP 限制或額外驗證
-- 此 API 可抓取使用者指定的 URL，公開部署時應考慮 SSRF 風險，避免允許存取內網、雲端 metadata 或其他敏感位址
-
-建議的 `.gitignore`：
-
-```gitignore
-.env
-__pycache__/
-*.pyc
-```
