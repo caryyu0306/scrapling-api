@@ -14,6 +14,7 @@ https://scrapling.readthedocs.io/en/latest/index.html
 - 支援靜態頁面與 JavaScript 動態頁面
 - `auto` 模式會先嘗試靜態抓取，必要時自動切換為動態抓取
 - **自動展開**：具備自動點擊網頁常見「閱讀更多」或摺疊內容的能力
+- **表單互動**：支援在 dynamic 模式先填入 input / textarea，再點擊按鈕並等待結果
 - **點擊模擬**：支援在抓取前執行手動指定的 CSS Selector 點擊操作
 - **內容清理與降噪**：Markdownify 前先移除 Nav、Footer、Aside、廣告、Cookie 橫幅等噪音節點
 - **主體萃取**：可自動挑選 `article` / `main` / `[role=main]` 等主體內容，也可手動指定 `content_selector`
@@ -36,7 +37,7 @@ https://scrapling.readthedocs.io/en/latest/index.html
 - [內容清理與主體萃取](#內容清理與主體萃取)
 - [Dynamic 併發與排隊控制](#dynamic-併發與排隊控制)
 - [User-Agent 輪換與 Basic Stealth](#user-agent-輪換與-basic-stealth)
-- [自動內容展開與點擊模擬](#自動內容展開與點擊模擬)
+- [Dynamic 表單互動、內容展開與點擊模擬](#dynamic-表單互動內容展開與點擊模擬)
 - [Auto 模式判斷方式](#auto-模式判斷方式)
 - [容器維護](#容器維護)
 - [常見問題](#常見問題)
@@ -55,7 +56,7 @@ FastAPI
     |
     +-- mode=static  ----> AsyncFetcher
     |
-    +-- mode=dynamic ----> DynamicFetcher (含點擊/展開互動)
+    +-- mode=dynamic ----> DynamicFetcher (含填表單/點擊/展開互動)
     |                         |
     |                         +-- Semaphore 控制瀏覽器併發
     |
@@ -63,7 +64,7 @@ FastAPI
           |
           +-- 先使用 AsyncFetcher
           |
-          +-- 判斷為 JavaScript 空殼頁、內容過短或帶有點擊需求
+          +-- 判斷為 JavaScript 空殼頁、內容過短或帶有表單/點擊需求
                   |
                   +-- 改用 DynamicFetcher
     |
@@ -212,6 +213,10 @@ http://localhost:8080/docs
 | `AUTO_EXPAND_AFTER_CLICK_WAIT` | `1000` | 毫秒 | 點擊按鈕後，額外等待資料載入的時間 |
 | `MAX_CLICK_SELECTORS` | `20` | 次 | 單次請求允許手動提供的 CSS Selector 數量上限 |
 | `MAX_CLICKS_PER_SELECTOR` | `20` | 次 | 每個 Selector 最多連續點擊次數 |
+| `MAX_INPUT_SELECTORS` | `20` | 個 | 單次請求允許提供的 `input_values` 數量上限 |
+| `MAX_INPUT_VALUE_LENGTH` | `2000` | 字元 | 每個 `input_values` 值允許的最大長度 |
+| `FORM_ACTION_TIMEOUT` | `15000` | 毫秒 | 填表單或等待 `wait_for_selector` 時，每個 selector 最長等待時間 |
+| `MAX_WAIT_AFTER_ACTIONS` | `60000` | 毫秒 | 單次請求允許 `wait_after_actions` 等待的最大時間 |
 | `CLEAN_CONTENT_DEFAULT` | `true` | 布林值 | 是否預設在 Markdownify 前清理 HTML |
 | `CONTENT_SELECTORS` | (內建列表) | - | 自動挑選主體內容的 CSS Selector 候選，以 `\|` 分隔 |
 | `CONTENT_MIN_TEXT_LENGTH` | `200` | 字元 | 主體候選節點至少要有多少文字才會被採用 |
@@ -248,7 +253,10 @@ JSON Body：
 | `mode` | 否 | `auto` | `auto`, `static`, `dynamic` | 抓取模式 |
 | `response_format` | 否 | `json` | `json`, `markdown` | 回應格式 |
 | `auto_expand` | 否 | `true` | 布林值 | 針對此請求是否執行自動展開 (僅動態模式有效) |
+| `input_values` | 否 | `{}` | Dict[str, str] | dynamic 模式中要填入的表單欄位，key 為 CSS Selector，value 為填入內容 |
 | `click_selectors` | 否 | `[]` | List[str] | 手動指定要點擊的 CSS Selectors |
+| `wait_for_selector` | 否 | `null` | CSS Selector | 執行表單填寫與點擊後，等待指定元素出現再抓 HTML |
+| `wait_after_actions` | 否 | `0` | 毫秒 | 執行表單填寫與點擊後額外等待多久，適合 WebSocket 或非同步結果頁 |
 | `clean_content` | 否 | `true` | 布林值 | 是否在 Markdownify 前執行內容清理與主體萃取 |
 | `content_selector` | 否 | `null` | CSS Selector | 手動指定要轉 Markdown 的主體節點 |
 | `remove_selectors` | 否 | `[]` | List[str] | 單次請求額外要刪除的 CSS Selectors |
@@ -272,6 +280,47 @@ curl -X POST http://localhost:8080/scrape \
   }'
 ```
 
+### 表單互動範例
+
+針對「進入頁面、填 input、點擊按鈕、等待結果」這類工具頁，可使用 `input_values` 搭配 `click_selectors`。例如 itdog HTTP 測速頁：
+
+```bash
+curl -X POST http://localhost:8080/scrape \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -d '{
+    "url": "https://www.itdog.cn/http/",
+    "mode": "dynamic",
+    "input_values": {
+      "#host": "https://example.com"
+    },
+    "click_selectors": [
+      "button.btn-primary.ml-3.mb-3"
+    ],
+    "wait_after_actions": 30000,
+    "clean_content": false,
+    "response_format": "markdown"
+  }'
+```
+
+如果目標頁面有穩定的結果節點，也可以用 `wait_for_selector` 取代固定等待：
+
+```json
+{
+  "url": "https://www.itdog.cn/http/",
+  "mode": "dynamic",
+  "input_values": {
+    "#host": "https://example.com"
+  },
+  "click_selectors": [
+    "button[onclick=\"check_form('fast')\"]"
+  ],
+  "wait_for_selector": ".node_tr",
+  "wait_after_actions": 5000,
+  "response_format": "markdown"
+}
+```
+
 ## 抓取模式
 
 ### `auto`
@@ -280,14 +329,14 @@ curl -X POST http://localhost:8080/scrape \
 
 1. 先使用 `AsyncFetcher` 進行靜態抓取。
 2. 檢查 HTML 是否包含 JavaScript 提示關鍵字或長度是否過短。
-3. **若請求內帶有 `click_selectors`**，或者命中上述條件，系統會自動切換為 `DynamicFetcher` 進行瀏覽器模擬。
+3. **若請求內帶有 `input_values`、`click_selectors`、`wait_for_selector` 或 `wait_after_actions`**，或者命中上述條件，系統會自動切換為 `DynamicFetcher` 進行瀏覽器模擬。
 
 ### `static`
 
 只使用 `AsyncFetcher`。
 
 優點：速度極快、資源消耗最低。
-限制：無法取得 JavaScript 渲染後的內容，且**不支援點擊模擬功能**。
+限制：無法取得 JavaScript 渲染後的內容，且**不支援表單填寫或點擊模擬功能**。
 
 ### `dynamic`
 
@@ -385,13 +434,21 @@ basic stealth 會做以下低成本強化：
 
 這不是 Captcha solver，也不會保證繞過進階反爬。它的目標是降低常見自動化破綻；如果目標站檢查 Canvas、WebGL、TLS fingerprint、IP reputation 或行為軌跡，仍需要進一步使用 StealthyFetcher、proxy/session 策略或人工授權流程。
 
-## 自動內容展開與點擊模擬
+## Dynamic 表單互動、內容展開與點擊模擬
 
-本服務專門為「抓取完整文章」設計了互動機制：
+本服務專門為「抓取完整文章」與「操作工具頁後抓結果」設計了互動機制：
 
+- **表單填寫**：透過 `input_values` 在 dynamic 模式中先填入指定 input / textarea，例如 `{"#host": "https://example.com"}`。
 - **自動展開**：會尋找頁面中符合關鍵字（如 `show more`, `read more`, `applies to`）且具備屬性 `aria-expanded="false"` 的按鈕自動點擊。
 - **手動點擊**：透過 `click_selectors` 參數，你可以精準控制瀏覽器點擊特定的 UI 元素（例如多個分頁標籤、載入更多按鈕等）。
+- **等待結果**：透過 `wait_for_selector` 等待結果節點出現，或用 `wait_after_actions` 在動作後固定等待一段時間，適合 WebSocket 或非同步載入頁。
 - **流程保護**：系統會透過 `MAX_CLICKS_PER_SELECTOR` 與超時機制保護，防止網頁因異常 Selector 導致無限點擊或佔用過多資源。
+
+互動順序固定為：
+
+```text
+input_values -> auto_expand -> click_selectors -> wait_for_selector -> wait_after_actions -> read HTML
+```
 
 ## Auto 模式判斷方式
 
