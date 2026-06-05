@@ -1,5 +1,7 @@
 import os
+import re
 
+from bs4 import BeautifulSoup, Comment
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import PlainTextResponse
 from markdownify import markdownify as md
@@ -34,6 +36,11 @@ def env_bool(name: str, default: bool) -> bool:
     raise RuntimeError(f"{name} must be true or false")
 
 
+def env_list(name: str, default: str) -> list[str]:
+    value = os.getenv(name, default)
+    return [item.strip() for item in value.split("|") if item.strip()]
+
+
 API_KEY = os.getenv("API_KEY")
 if not API_KEY:
     raise RuntimeError("API_KEY is required")
@@ -53,6 +60,33 @@ AUTO_EXPAND_WAIT_TIMEOUT = env_int("AUTO_EXPAND_WAIT_TIMEOUT", 15000)
 AUTO_EXPAND_AFTER_CLICK_WAIT = env_int("AUTO_EXPAND_AFTER_CLICK_WAIT", 1000)
 MAX_CLICK_SELECTORS = env_int("MAX_CLICK_SELECTORS", 20)
 MAX_CLICKS_PER_SELECTOR = env_int("MAX_CLICKS_PER_SELECTOR", 20)
+
+CLEAN_CONTENT_DEFAULT = env_bool("CLEAN_CONTENT_DEFAULT", True)
+MAX_CLEANING_SELECTORS = env_int("MAX_CLEANING_SELECTORS", 50)
+CONTENT_MIN_TEXT_LENGTH = env_int("CONTENT_MIN_TEXT_LENGTH", 200)
+
+DEFAULT_CONTENT_SELECTORS = (
+    "article|main|[role='main']|#content|#main-content|.content|.main-content|"
+    ".post-content|.entry-content|.article-content"
+)
+
+CONTENT_SELECTORS = env_list("CONTENT_SELECTORS", DEFAULT_CONTENT_SELECTORS)
+
+DEFAULT_REMOVE_TAGS = (
+    "script|style|noscript|template|nav|footer|aside|iframe|svg|canvas|form|"
+    "input|select|textarea|button"
+)
+
+REMOVE_TAGS = env_list("REMOVE_TAGS", DEFAULT_REMOVE_TAGS)
+
+DEFAULT_REMOVE_SELECTORS = (
+    "[role='navigation']|[role='banner']|[role='contentinfo']|[aria-hidden='true']|"
+    ".ad|.ads|.advertisement|.banner|.cookie|.cookie-banner|.cookies|.footer|"
+    ".menu|.nav|.navbar|.newsletter|.popup|.sidebar|.social-share|"
+    ".subscribe|.related-posts|.recommended|#ad|#ads|#footer|#header|#nav|#sidebar"
+)
+
+REMOVE_SELECTORS = env_list("REMOVE_SELECTORS", DEFAULT_REMOVE_SELECTORS)
 
 DEFAULT_AUTO_EXPAND_SELECTOR = (
     "main button[aria-expanded='false'], "
@@ -105,6 +139,9 @@ class ScrapeRequest(BaseModel):
     response_format: str = "json"  # json / markdown
     auto_expand: bool = AUTO_EXPAND_DEFAULT
     click_selectors: list[str] = Field(default_factory=list)
+    clean_content: bool = CLEAN_CONTENT_DEFAULT
+    content_selector: str | None = None
+    remove_selectors: list[str] = Field(default_factory=list)
 
 
 @app.get("/health")
@@ -203,6 +240,83 @@ def should_use_dynamic(html: str) -> bool:
     return False
 
 
+def remove_matching_selectors(soup: BeautifulSoup, selectors: list[str]) -> None:
+    for selector in selectors:
+        try:
+            for element in soup.select(selector):
+                element.decompose()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid remove selector: {selector}",
+            ) from exc
+
+
+def pick_content_root(soup: BeautifulSoup, content_selector: str | None):
+    if content_selector:
+        try:
+            matches = soup.select(content_selector)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid content_selector: {content_selector}",
+            ) from exc
+
+        if not matches:
+            raise HTTPException(
+                status_code=400,
+                detail=f"content_selector did not match anything: {content_selector}",
+            )
+
+        return matches[0]
+
+    candidates = []
+    for selector in CONTENT_SELECTORS:
+        try:
+            candidates.extend(soup.select(selector))
+        except Exception:
+            continue
+
+    best = None
+    best_length = 0
+    for candidate in candidates:
+        text_length = len(candidate.get_text(" ", strip=True))
+        if text_length > best_length:
+            best = candidate
+            best_length = text_length
+
+    if best is not None and best_length >= CONTENT_MIN_TEXT_LENGTH:
+        return best
+
+    return soup.body or soup
+
+
+def clean_html_for_markdown(
+    html: str,
+    content_selector: str | None,
+    remove_selectors: list[str],
+) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+
+    for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+        comment.extract()
+
+    for tag_name in REMOVE_TAGS:
+        for element in soup.find_all(tag_name):
+            element.decompose()
+
+    remove_matching_selectors(soup, REMOVE_SELECTORS + remove_selectors)
+    content_root = pick_content_root(soup, content_selector)
+
+    return str(content_root)
+
+
+def distill_markdown(markdown: str) -> str:
+    markdown = "\n".join(line.rstrip() for line in markdown.splitlines())
+    markdown = re.sub(r"\n{3,}", "\n\n", markdown)
+    return markdown.strip()
+
+
 @app.post("/scrape")
 async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
     if x_api_key != API_KEY:
@@ -212,6 +326,11 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
     mode = req.mode.lower()
     response_format = req.response_format.lower()
     click_selectors = [selector.strip() for selector in req.click_selectors if selector.strip()]
+    remove_selectors = [
+        selector.strip()
+        for selector in req.remove_selectors
+        if selector.strip()
+    ]
 
     if mode not in {"auto", "static", "dynamic"}:
         raise HTTPException(status_code=400, detail="Invalid mode")
@@ -223,6 +342,12 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
         raise HTTPException(
             status_code=400,
             detail=f"Too many click_selectors; maximum is {MAX_CLICK_SELECTORS}",
+        )
+
+    if len(remove_selectors) > MAX_CLEANING_SELECTORS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many remove_selectors; maximum is {MAX_CLEANING_SELECTORS}",
         )
 
     if mode == "static" and click_selectors:
@@ -248,7 +373,15 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
                     click_selectors,
                 )
 
-        markdown = md(html)
+        markdown_html = html
+        if req.clean_content:
+            markdown_html = clean_html_for_markdown(
+                html,
+                req.content_selector,
+                remove_selectors,
+            )
+
+        markdown = distill_markdown(md(markdown_html))
 
         if response_format == "markdown":
             return PlainTextResponse(

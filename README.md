@@ -14,6 +14,8 @@ https://github.com/D4Vinci/Scrapling
 - `auto` 模式會先嘗試靜態抓取，必要時自動切換為動態抓取
 - **自動展開**：具備自動點擊網頁常見「閱讀更多」或摺疊內容的能力
 - **點擊模擬**：支援在抓取前執行手動指定的 CSS Selector 點擊操作
+- **內容清理與降噪**：Markdownify 前先移除 Nav、Footer、Aside、廣告、Cookie 橫幅等噪音節點
+- **主體萃取**：可自動挑選 `article` / `main` / `[role=main]` 等主體內容，也可手動指定 `content_selector`
 - 支援 JSON 或純 Markdown 回應格式
 - 使用 `x-api-key` Header 進行簡單 API 驗證
 - 可透過 `.env` 調整逾時、重試、等待時間與自動判斷條件
@@ -27,6 +29,7 @@ https://github.com/D4Vinci/Scrapling
 - [環境變數設定](#環境變數設定)
 - [API 使用方式](#api-使用方式)
 - [抓取模式](#抓取模式)
+- [內容清理與主體萃取](#內容清理與主體萃取)
 - [自動內容展開與點擊模擬](#自動內容展開與點擊模擬)
 - [Auto 模式判斷方式](#auto-模式判斷方式)
 - [容器維護](#容器維護)
@@ -55,7 +58,7 @@ FastAPI
                   +-- 改用 DynamicFetcher
     |
     v
-HTML -> Markdown -> JSON 或 Markdown 回應
+HTML -> Clean HTML -> Markdown -> Distilled Markdown -> JSON 或 Markdown 回應
 ```
 
 ## 專案檔案
@@ -70,14 +73,14 @@ scrapling-api/
 
 ### `Dockerfile`
 
-以 `pyd4vinci/scrapling` 為基底映像，安裝 Scrapling、FastAPI、Uvicorn 與 Markdownify，並啟動 API 服務。
+以 `pyd4vinci/scrapling` 為基底映像，安裝 Scrapling、FastAPI、Uvicorn、Markdownify 與 BeautifulSoup，並啟動 API 服務。
 
 ```dockerfile
 FROM pyd4vinci/scrapling
 
 WORKDIR /service
 
-RUN python -m pip install --no-cache-dir "scrapling[all]" fastapi "uvicorn[standard]\" markdownify
+RUN python -m pip install --no-cache-dir "scrapling[all]" fastapi "uvicorn[standard]" markdownify beautifulsoup4
 
 COPY main.py .
 
@@ -187,6 +190,12 @@ http://localhost:8080/docs
 | `AUTO_EXPAND_AFTER_CLICK_WAIT` | `1000` | 毫秒 | 點擊按鈕後，額外等待資料載入的時間 |
 | `MAX_CLICK_SELECTORS` | `20` | 次 | 單次請求允許手動提供的 CSS Selector 數量上限 |
 | `MAX_CLICKS_PER_SELECTOR` | `20` | 次 | 每個 Selector 最多連續點擊次數 |
+| `CLEAN_CONTENT_DEFAULT` | `true` | 布林值 | 是否預設在 Markdownify 前清理 HTML |
+| `CONTENT_SELECTORS` | (內建列表) | - | 自動挑選主體內容的 CSS Selector 候選，以 `\|` 分隔 |
+| `CONTENT_MIN_TEXT_LENGTH` | `200` | 字元 | 主體候選節點至少要有多少文字才會被採用 |
+| `REMOVE_TAGS` | (內建列表) | - | Markdownify 前一律刪除的 HTML tags，以 `\|` 分隔 |
+| `REMOVE_SELECTORS` | (內建列表) | - | Markdownify 前一律刪除的 CSS Selectors，以 `\|` 分隔 |
+| `MAX_CLEANING_SELECTORS` | `50` | 個 | 單次請求允許額外提供的 `remove_selectors` 數量上限 |
 
 ## API 使用方式
 
@@ -218,6 +227,9 @@ JSON Body：
 | `response_format` | 否 | `json` | `json`, `markdown` | 回應格式 |
 | `auto_expand` | 否 | `true` | 布林值 | 針對此請求是否執行自動展開 (僅動態模式有效) |
 | `click_selectors` | 否 | `[]` | List[str] | 手動指定要點擊的 CSS Selectors |
+| `clean_content` | 否 | `true` | 布林值 | 是否在 Markdownify 前執行內容清理與主體萃取 |
+| `content_selector` | 否 | `null` | CSS Selector | 手動指定要轉 Markdown 的主體節點 |
+| `remove_selectors` | 否 | `[]` | List[str] | 單次請求額外要刪除的 CSS Selectors |
 
 ### 綜合使用範例 (含點擊模擬)
 
@@ -232,6 +244,8 @@ curl -X POST http://localhost:8080/scrape \
     "mode": "auto",
     "auto_expand": true,
     "click_selectors": [".more-info-btn", "#details-tab"],
+    "content_selector": "main article",
+    "remove_selectors": [".ad-slot", ".related-jobs"],
     "response_format": "markdown"
   }'
 ```
@@ -259,6 +273,30 @@ curl -X POST http://localhost:8080/scrape \
 
 優點：適合 104、myF5、以及任何需要執行 JS 點擊或等待資源載入的網站。
 限制：速度較慢、資源消耗較高。
+
+## 內容清理與主體萃取
+
+系統預設會先清理 HTML，再交給 Markdownify。這可以大幅降低選單、頁尾、廣告、Cookie 提示、社群分享、推薦文章等噪音，避免輸出 Token 數爆表。
+
+預設清理流程：
+
+1. 移除註解、`script`、`style`、`nav`、`footer`、`aside`、`iframe`、表單與按鈕等節點。
+2. 移除常見噪音 selector，例如 `.ads`、`.cookie-banner`、`.sidebar`、`.social-share`、`.related-posts`。
+3. 從 `article`、`main`、`[role='main']`、`.entry-content` 等候選節點中挑出文字量最多的主體內容。
+4. 將清理後的 HTML 轉成 Markdown，並壓縮多餘空白行。
+
+單次請求可用 `content_selector` 精準指定主體，例如：
+
+```json
+{
+  "url": "https://example.com/post",
+  "content_selector": "article.post",
+  "remove_selectors": [".author-box", ".related-posts"],
+  "response_format": "markdown"
+}
+```
+
+如果特殊網站需要完整原始 HTML 轉 Markdown，可傳入 `"clean_content": false` 關閉清理。
 
 ## 自動內容展開與點擊模擬
 
