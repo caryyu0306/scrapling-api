@@ -17,6 +17,8 @@ https://github.com/D4Vinci/Scrapling
 - **內容清理與降噪**：Markdownify 前先移除 Nav、Footer、Aside、廣告、Cookie 橫幅等噪音節點
 - **主體萃取**：可自動挑選 `article` / `main` / `[role=main]` 等主體內容，也可手動指定 `content_selector`
 - **併發保護**：使用 Semaphore 限制同時執行的 DynamicFetcher 數量，避免瀏覽器併發拖垮 Docker 主機
+- **User-Agent 輪換**：每次 `/scrape` 請求自動挑選 User-Agent，且 `auto` fallback 會沿用同一個 UA
+- **Basic stealth**：在 dynamic 模式加入語系、時區、viewport、Chromium flag 與 `navigator.webdriver` 隱藏
 - 支援 JSON 或純 Markdown 回應格式
 - 使用 `x-api-key` Header 進行簡單 API 驗證
 - 可透過 `.env` 調整逾時、重試、等待時間與自動判斷條件
@@ -32,6 +34,7 @@ https://github.com/D4Vinci/Scrapling
 - [抓取模式](#抓取模式)
 - [內容清理與主體萃取](#內容清理與主體萃取)
 - [Dynamic 併發與排隊控制](#dynamic-併發與排隊控制)
+- [User-Agent 輪換與 Basic Stealth](#user-agent-輪換與-basic-stealth)
 - [自動內容展開與點擊模擬](#自動內容展開與點擊模擬)
 - [Auto 模式判斷方式](#auto-模式判斷方式)
 - [容器維護](#容器維護)
@@ -46,6 +49,8 @@ Client
     | x-api-key: YOUR_API_KEY
     v
 FastAPI
+    |
+    +-- 每次請求挑選 User-Agent
     |
     +-- mode=static  ----> AsyncFetcher
     |
@@ -188,6 +193,16 @@ http://localhost:8080/docs
 | `DYNAMIC_DISABLE_RESOURCES` | `false` | 布林值 | 是否阻擋 CSS、圖片、字型等資源 |
 | `DYNAMIC_CONCURRENCY` | `2` | 個 | 同時允許執行的 DynamicFetcher 數量 |
 | `DYNAMIC_QUEUE_TIMEOUT` | `120` | 秒 | dynamic 請求等待併發名額的最長時間，超過回傳 503 |
+| `DYNAMIC_STEALTH_BASIC` | `true` | 布林值 | 是否啟用 DynamicFetcher basic stealth 強化 |
+| `DYNAMIC_LOCALE` | `zh-TW` | - | dynamic browser context 的 locale |
+| `DYNAMIC_TIMEZONE` | `Asia/Taipei` | - | dynamic browser context 的 timezone |
+| `DYNAMIC_ACCEPT_LANGUAGE` | `zh-TW,zh;q=0.9,en;q=0.8` | - | static/dynamic 請求使用的 Accept-Language |
+| `DYNAMIC_VIEWPORT_WIDTH` | `1366` | px | dynamic browser viewport / screen 寬度 |
+| `DYNAMIC_VIEWPORT_HEIGHT` | `768` | px | dynamic browser viewport / screen 高度 |
+| `DYNAMIC_DEVICE_SCALE_FACTOR` | `1` | 倍 | dynamic browser device scale factor |
+| `DYNAMIC_EXTRA_FLAGS` | `--disable-blink-features=AutomationControlled` | - | Chromium 啟動 flags，以 `\|` 分隔 |
+| `USER_AGENT_ROTATION` | `true` | 布林值 | 是否每次 `/scrape` 請求隨機挑選 User-Agent |
+| `USER_AGENTS` | (內建列表) | - | 自訂 User-Agent 池，以 `\|` 分隔；空白時使用內建列表 |
 | `AUTO_MIN_HTML_LENGTH` | `1000` | 字元 | 靜態 HTML 少於此長度時，`auto` 模式改用動態抓取 |
 | `EXTRA_JS_SIGNALS` | 空白 | - | 額外的 JavaScript 頁面辨識關鍵字，以 `\|` 分隔 |
 | `AUTO_EXPAND_DEFAULT` | `true` | 布林值 | 是否預設啟動自動內容展開功能 |
@@ -322,6 +337,52 @@ DYNAMIC_QUEUE_TIMEOUT=120
 3. 如果等待超過 `DYNAMIC_QUEUE_TIMEOUT` 秒，API 會回傳 `503 Dynamic fetch queue timeout`。
 
 小型 VPS 建議把 `DYNAMIC_CONCURRENCY` 設為 `1` 或 `2`。如果使用多個 Uvicorn worker 或多個容器副本，每個 process 都會有自己的 semaphore；需要跨 process 的全域限制時，應改用 Redis queue、Celery、RQ 或其他外部 worker queue。
+
+## User-Agent 輪換與 Basic Stealth
+
+本服務預設會在每次 `/scrape` 請求開始時，從 User-Agent 池挑選一個 `selected_user_agent`。這個選擇發生在 API 內部，不需要 n8n 或呼叫端提供瀏覽器特徵。
+
+```text
+n8n / client -> POST /scrape
+              -> scrapling-api 隨機挑選 User-Agent
+              -> static / dynamic 抓取沿用同一個 User-Agent
+              -> 目標網站看到的是 API 選出的 User-Agent
+```
+
+`auto` 模式若先用 static 抓取，後來 fallback 到 dynamic，兩次抓取會沿用同一個 User-Agent，避免同一個請求看起來像不同瀏覽器。
+
+預設設定：
+
+```env
+USER_AGENT_ROTATION=true
+USER_AGENTS=
+```
+
+`USER_AGENTS` 留空時會使用 `main.py` 內建的少量現代桌面瀏覽器 User-Agent。若要自訂，多個 UA 使用 `|` 分隔。
+
+dynamic 模式還可啟用 basic stealth：
+
+```env
+DYNAMIC_STEALTH_BASIC=true
+DYNAMIC_LOCALE=zh-TW
+DYNAMIC_TIMEZONE=Asia/Taipei
+DYNAMIC_ACCEPT_LANGUAGE=zh-TW,zh;q=0.9,en;q=0.8
+DYNAMIC_VIEWPORT_WIDTH=1366
+DYNAMIC_VIEWPORT_HEIGHT=768
+DYNAMIC_DEVICE_SCALE_FACTOR=1
+DYNAMIC_EXTRA_FLAGS=--disable-blink-features=AutomationControlled
+```
+
+basic stealth 會做以下低成本強化：
+
+1. 將選出的 User-Agent 傳入 `DynamicFetcher.async_fetch(useragent=...)`。
+2. 將 `Accept-Language` 與 `locale` 對齊。
+3. 設定 `timezone_id`，避免瀏覽器時區與語系不一致。
+4. 設定 viewport、screen、device scale、mobile/touch 狀態。
+5. 加入 Chromium flag `--disable-blink-features=AutomationControlled`。
+6. 在頁面載入前注入 script，讓 `navigator.webdriver` 回傳 `undefined`。
+
+這不是 Captcha solver，也不會保證繞過進階反爬。它的目標是降低常見自動化破綻；如果目標站檢查 Canvas、WebGL、TLS fingerprint、IP reputation 或行為軌跡，仍需要進一步使用 StealthyFetcher、proxy/session 策略或人工授權流程。
 
 ## 自動內容展開與點擊模擬
 

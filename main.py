@@ -1,5 +1,6 @@
 import asyncio
 import os
+import random
 import re
 
 from bs4 import BeautifulSoup, Comment
@@ -23,6 +24,17 @@ def env_int(name: str, default: int) -> int:
         raise RuntimeError(f"{name} must be an integer") from exc
 
 
+def env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a number") from exc
+
+
 def env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -39,6 +51,9 @@ def env_bool(name: str, default: bool) -> bool:
 
 def env_list(name: str, default: str) -> list[str]:
     value = os.getenv(name, default)
+    if not value.strip():
+        value = default
+
     return [item.strip() for item in value.split("|") if item.strip()]
 
 
@@ -56,6 +71,20 @@ DYNAMIC_NETWORK_IDLE = env_bool("DYNAMIC_NETWORK_IDLE", True)
 DYNAMIC_DISABLE_RESOURCES = env_bool("DYNAMIC_DISABLE_RESOURCES", False)
 DYNAMIC_CONCURRENCY = env_int("DYNAMIC_CONCURRENCY", 2)
 DYNAMIC_QUEUE_TIMEOUT = env_int("DYNAMIC_QUEUE_TIMEOUT", 120)
+DYNAMIC_STEALTH_BASIC = env_bool("DYNAMIC_STEALTH_BASIC", True)
+DYNAMIC_LOCALE = os.getenv("DYNAMIC_LOCALE", "zh-TW")
+DYNAMIC_TIMEZONE = os.getenv("DYNAMIC_TIMEZONE", "Asia/Taipei")
+DYNAMIC_ACCEPT_LANGUAGE = os.getenv(
+    "DYNAMIC_ACCEPT_LANGUAGE",
+    "zh-TW,zh;q=0.9,en;q=0.8",
+)
+DYNAMIC_VIEWPORT_WIDTH = env_int("DYNAMIC_VIEWPORT_WIDTH", 1366)
+DYNAMIC_VIEWPORT_HEIGHT = env_int("DYNAMIC_VIEWPORT_HEIGHT", 768)
+DYNAMIC_DEVICE_SCALE_FACTOR = env_float("DYNAMIC_DEVICE_SCALE_FACTOR", 1.0)
+DYNAMIC_EXTRA_FLAGS = env_list(
+    "DYNAMIC_EXTRA_FLAGS",
+    "--disable-blink-features=AutomationControlled",
+)
 
 if DYNAMIC_CONCURRENCY < 1:
     raise RuntimeError("DYNAMIC_CONCURRENCY must be at least 1")
@@ -64,6 +93,22 @@ if DYNAMIC_QUEUE_TIMEOUT < 1:
     raise RuntimeError("DYNAMIC_QUEUE_TIMEOUT must be at least 1")
 
 dynamic_semaphore = asyncio.Semaphore(DYNAMIC_CONCURRENCY)
+
+DEFAULT_USER_AGENTS = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36|"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36|"
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36|"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/18.0 Safari/605.1.15|"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) "
+    "Gecko/20100101 Firefox/140.0"
+)
+
+USER_AGENT_ROTATION = env_bool("USER_AGENT_ROTATION", True)
+USER_AGENTS = env_list("USER_AGENTS", DEFAULT_USER_AGENTS)
 
 AUTO_MIN_HTML_LENGTH = env_int("AUTO_MIN_HTML_LENGTH", 1000)
 AUTO_EXPAND_DEFAULT = env_bool("AUTO_EXPAND_DEFAULT", True)
@@ -160,12 +205,65 @@ def health():
     return {"ok": True}
 
 
-async def fetch_static(url: str):
+def choose_user_agent() -> str | None:
+    if not USER_AGENT_ROTATION or not USER_AGENTS:
+        return None
+
+    return random.choice(USER_AGENTS)
+
+
+def build_request_headers(user_agent: str | None) -> dict[str, str] | None:
+    headers = {}
+
+    if user_agent:
+        headers["User-Agent"] = user_agent
+
+    if DYNAMIC_STEALTH_BASIC and DYNAMIC_ACCEPT_LANGUAGE:
+        headers["Accept-Language"] = DYNAMIC_ACCEPT_LANGUAGE
+
+    return headers or None
+
+
+def build_dynamic_additional_args() -> dict:
+    if not DYNAMIC_STEALTH_BASIC:
+        return {}
+
+    return {
+        "viewport": {
+            "width": DYNAMIC_VIEWPORT_WIDTH,
+            "height": DYNAMIC_VIEWPORT_HEIGHT,
+        },
+        "screen": {
+            "width": DYNAMIC_VIEWPORT_WIDTH,
+            "height": DYNAMIC_VIEWPORT_HEIGHT,
+        },
+        "device_scale_factor": DYNAMIC_DEVICE_SCALE_FACTOR,
+        "is_mobile": False,
+        "has_touch": False,
+        "color_scheme": "light",
+    }
+
+
+async def setup_stealth_page(page) -> None:
+    if not DYNAMIC_STEALTH_BASIC:
+        return
+
+    await page.add_init_script(
+        """
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined
+        });
+        """
+    )
+
+
+async def fetch_static(url: str, user_agent: str | None):
     page = await AsyncFetcher.get(
         url,
         timeout=STATIC_TIMEOUT,
         retries=STATIC_RETRIES,
         stealthy_headers=STATIC_STEALTHY_HEADERS,
+        headers=build_request_headers(user_agent),
     )
 
     html = page.body.decode("utf-8", errors="ignore")
@@ -212,7 +310,12 @@ async def expand_common_content(page) -> int:
     return clicked
 
 
-async def fetch_dynamic(url: str, auto_expand: bool, click_selectors: list[str]):
+async def fetch_dynamic(
+    url: str,
+    auto_expand: bool,
+    click_selectors: list[str],
+    user_agent: str | None,
+):
     async def interact_with_page(page):
         clicked = 0
 
@@ -240,10 +343,17 @@ async def fetch_dynamic(url: str, auto_expand: bool, click_selectors: list[str])
         page = await DynamicFetcher.async_fetch(
             url,
             headless=True,
+            useragent=user_agent,
+            locale=DYNAMIC_LOCALE if DYNAMIC_STEALTH_BASIC else None,
+            timezone_id=DYNAMIC_TIMEZONE if DYNAMIC_STEALTH_BASIC else None,
+            extra_headers=build_request_headers(None),
+            extra_flags=DYNAMIC_EXTRA_FLAGS if DYNAMIC_STEALTH_BASIC else None,
+            additional_args=build_dynamic_additional_args(),
             timeout=DYNAMIC_TIMEOUT,
             network_idle=DYNAMIC_NETWORK_IDLE,
             wait=DYNAMIC_WAIT,
             disable_resources=DYNAMIC_DISABLE_RESOURCES,
+            page_setup=setup_stealth_page if DYNAMIC_STEALTH_BASIC else None,
             page_action=interact_with_page,
         )
     finally:
@@ -382,20 +492,24 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
         )
 
     try:
+        selected_user_agent = choose_user_agent()
+
         if mode == "dynamic":
             status, html, used_mode = await fetch_dynamic(
                 url,
                 req.auto_expand,
                 click_selectors,
+                selected_user_agent,
             )
         else:
-            status, html, used_mode = await fetch_static(url)
+            status, html, used_mode = await fetch_static(url, selected_user_agent)
 
             if mode == "auto" and (should_use_dynamic(html) or click_selectors):
                 status, html, used_mode = await fetch_dynamic(
                     url,
                     req.auto_expand,
                     click_selectors,
+                    selected_user_agent,
                 )
 
         markdown_html = html
