@@ -282,20 +282,20 @@ curl -X POST http://localhost:8080/scrape \
 
 ### 表單互動範例
 
-針對「進入頁面、填 input、點擊按鈕、等待結果」這類工具頁，可使用 `input_values` 搭配 `click_selectors`。例如 itdog HTTP 測速頁：
+針對「進入頁面、填 input、點擊按鈕、等待結果」這類工具頁，可使用 `input_values` 搭配 `click_selectors`。例如 boce 網站測速頁：
 
 ```bash
 curl -X POST http://localhost:8080/scrape \
   -H "Content-Type: application/json" \
   -H "x-api-key: YOUR_API_KEY" \
   -d '{
-    "url": "https://www.itdog.cn/http/",
+    "url": "https://www.boce.com/http",
     "mode": "dynamic",
     "input_values": {
-      "#host": "https://example.com"
+      "input[name=\"host\"]": "https://example.com"
     },
     "click_selectors": [
-      "button.btn-primary.ml-3.mb-3"
+      ".banner_submit.action_submit"
     ],
     "wait_after_actions": 30000,
     "clean_content": false,
@@ -303,20 +303,22 @@ curl -X POST http://localhost:8080/scrape \
   }'
 ```
 
-如果目標頁面有穩定的結果節點，也可以用 `wait_for_selector` 取代固定等待：
+boce 會依帳號狀態限制免費檢測次數。若未登入或當日遊客額度用完，API 仍會完成填入與點擊，但回傳內容會是 boce 的額度/登入提示，而不是測速結果。實務上建議在 n8n 後續 Code node 偵測 `今日免费检测次数已用完` 或 `立即登录`，遇到時改走人工登入或 API 方案。
+
+n8n HTTP Request body 可直接使用：
 
 ```json
 {
-  "url": "https://www.itdog.cn/http/",
+  "url": "https://www.boce.com/http",
   "mode": "dynamic",
   "input_values": {
-    "#host": "https://example.com"
+    "input[name=\"host\"]": "https://example.com"
   },
   "click_selectors": [
-    "button[onclick=\"check_form('fast')\"]"
+    ".banner_submit.action_submit"
   ],
-  "wait_for_selector": ".node_tr",
-  "wait_after_actions": 5000,
+  "wait_after_actions": 30000,
+  "clean_content": false,
   "response_format": "markdown"
 }
 ```
