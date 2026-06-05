@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 
@@ -53,6 +54,16 @@ DYNAMIC_TIMEOUT = env_int("DYNAMIC_TIMEOUT", 60000)
 DYNAMIC_WAIT = env_int("DYNAMIC_WAIT", 5000)
 DYNAMIC_NETWORK_IDLE = env_bool("DYNAMIC_NETWORK_IDLE", True)
 DYNAMIC_DISABLE_RESOURCES = env_bool("DYNAMIC_DISABLE_RESOURCES", False)
+DYNAMIC_CONCURRENCY = env_int("DYNAMIC_CONCURRENCY", 2)
+DYNAMIC_QUEUE_TIMEOUT = env_int("DYNAMIC_QUEUE_TIMEOUT", 120)
+
+if DYNAMIC_CONCURRENCY < 1:
+    raise RuntimeError("DYNAMIC_CONCURRENCY must be at least 1")
+
+if DYNAMIC_QUEUE_TIMEOUT < 1:
+    raise RuntimeError("DYNAMIC_QUEUE_TIMEOUT must be at least 1")
+
+dynamic_semaphore = asyncio.Semaphore(DYNAMIC_CONCURRENCY)
 
 AUTO_MIN_HTML_LENGTH = env_int("AUTO_MIN_HTML_LENGTH", 1000)
 AUTO_EXPAND_DEFAULT = env_bool("AUTO_EXPAND_DEFAULT", True)
@@ -214,15 +225,29 @@ async def fetch_dynamic(url: str, auto_expand: bool, click_selectors: list[str])
         if clicked:
             await page.wait_for_timeout(AUTO_EXPAND_AFTER_CLICK_WAIT)
 
-    page = await DynamicFetcher.async_fetch(
-        url,
-        headless=True,
-        timeout=DYNAMIC_TIMEOUT,
-        network_idle=DYNAMIC_NETWORK_IDLE,
-        wait=DYNAMIC_WAIT,
-        disable_resources=DYNAMIC_DISABLE_RESOURCES,
-        page_action=interact_with_page,
-    )
+    try:
+        await asyncio.wait_for(
+            dynamic_semaphore.acquire(),
+            timeout=DYNAMIC_QUEUE_TIMEOUT,
+        )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Dynamic fetch queue timeout",
+        ) from exc
+
+    try:
+        page = await DynamicFetcher.async_fetch(
+            url,
+            headless=True,
+            timeout=DYNAMIC_TIMEOUT,
+            network_idle=DYNAMIC_NETWORK_IDLE,
+            wait=DYNAMIC_WAIT,
+            disable_resources=DYNAMIC_DISABLE_RESOURCES,
+            page_action=interact_with_page,
+        )
+    finally:
+        dynamic_semaphore.release()
 
     html = page.body.decode("utf-8", errors="ignore")
     return page.status, html, "dynamic"

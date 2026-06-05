@@ -16,6 +16,7 @@ https://github.com/D4Vinci/Scrapling
 - **點擊模擬**：支援在抓取前執行手動指定的 CSS Selector 點擊操作
 - **內容清理與降噪**：Markdownify 前先移除 Nav、Footer、Aside、廣告、Cookie 橫幅等噪音節點
 - **主體萃取**：可自動挑選 `article` / `main` / `[role=main]` 等主體內容，也可手動指定 `content_selector`
+- **併發保護**：使用 Semaphore 限制同時執行的 DynamicFetcher 數量，避免瀏覽器併發拖垮 Docker 主機
 - 支援 JSON 或純 Markdown 回應格式
 - 使用 `x-api-key` Header 進行簡單 API 驗證
 - 可透過 `.env` 調整逾時、重試、等待時間與自動判斷條件
@@ -30,6 +31,7 @@ https://github.com/D4Vinci/Scrapling
 - [API 使用方式](#api-使用方式)
 - [抓取模式](#抓取模式)
 - [內容清理與主體萃取](#內容清理與主體萃取)
+- [Dynamic 併發與排隊控制](#dynamic-併發與排隊控制)
 - [自動內容展開與點擊模擬](#自動內容展開與點擊模擬)
 - [Auto 模式判斷方式](#auto-模式判斷方式)
 - [容器維護](#容器維護)
@@ -48,6 +50,8 @@ FastAPI
     +-- mode=static  ----> AsyncFetcher
     |
     +-- mode=dynamic ----> DynamicFetcher (含點擊/展開互動)
+    |                         |
+    |                         +-- Semaphore 控制瀏覽器併發
     |
     +-- mode=auto
           |
@@ -182,6 +186,8 @@ http://localhost:8080/docs
 | `DYNAMIC_WAIT` | `5000` | 毫秒 | 頁面載入後，額外等待多久才讀取 HTML |
 | `DYNAMIC_NETWORK_IDLE` | `true` | 布林值 | 是否等待網路活動進入閒置狀態 |
 | `DYNAMIC_DISABLE_RESOURCES` | `false` | 布林值 | 是否阻擋 CSS、圖片、字型等資源 |
+| `DYNAMIC_CONCURRENCY` | `2` | 個 | 同時允許執行的 DynamicFetcher 數量 |
+| `DYNAMIC_QUEUE_TIMEOUT` | `120` | 秒 | dynamic 請求等待併發名額的最長時間，超過回傳 503 |
 | `AUTO_MIN_HTML_LENGTH` | `1000` | 字元 | 靜態 HTML 少於此長度時，`auto` 模式改用動態抓取 |
 | `EXTRA_JS_SIGNALS` | 空白 | - | 額外的 JavaScript 頁面辨識關鍵字，以 `\|` 分隔 |
 | `AUTO_EXPAND_DEFAULT` | `true` | 布林值 | 是否預設啟動自動內容展開功能 |
@@ -297,6 +303,25 @@ curl -X POST http://localhost:8080/scrape \
 ```
 
 如果特殊網站需要完整原始 HTML 轉 Markdown，可傳入 `"clean_content": false` 關閉清理。
+
+## Dynamic 併發與排隊控制
+
+`dynamic` 模式會啟動無頭瀏覽器，CPU 與 RAM 成本比靜態抓取高很多。服務預設使用 `asyncio.Semaphore` 限制同時執行的 DynamicFetcher 數量，超過上限的請求會在 FastAPI process 內排隊等待。
+
+預設設定：
+
+```env
+DYNAMIC_CONCURRENCY=2
+DYNAMIC_QUEUE_TIMEOUT=120
+```
+
+行為說明：
+
+1. 每個 dynamic 請求進入 `fetch_dynamic()` 時會先等待 semaphore。
+2. 有名額才會真正呼叫 `DynamicFetcher.async_fetch()` 並啟動瀏覽器。
+3. 如果等待超過 `DYNAMIC_QUEUE_TIMEOUT` 秒，API 會回傳 `503 Dynamic fetch queue timeout`。
+
+小型 VPS 建議把 `DYNAMIC_CONCURRENCY` 設為 `1` 或 `2`。如果使用多個 Uvicorn worker 或多個容器副本，每個 process 都會有自己的 semaphore；需要跨 process 的全域限制時，應改用 Redis queue、Celery、RQ 或其他外部 worker queue。
 
 ## 自動內容展開與點擊模擬
 
