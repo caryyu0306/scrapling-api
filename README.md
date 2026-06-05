@@ -4,7 +4,6 @@
 
 此服務支援靜態抓取、JavaScript 動態頁面抓取，以及自動判斷模式，適合提供給 n8n、內部工具或其他程式呼叫。
 
-
 https://scrapling.readthedocs.io/en/latest/index.html
 
 https://github.com/D4Vinci/Scrapling
@@ -13,6 +12,8 @@ https://github.com/D4Vinci/Scrapling
 
 - 支援靜態頁面與 JavaScript 動態頁面
 - `auto` 模式會先嘗試靜態抓取，必要時自動切換為動態抓取
+- **自動展開**：具備自動點擊網頁常見「閱讀更多」或摺疊內容的能力
+- **點擊模擬**：支援在抓取前執行手動指定的 CSS Selector 點擊操作
 - 支援 JSON 或純 Markdown 回應格式
 - 使用 `x-api-key` Header 進行簡單 API 驗證
 - 可透過 `.env` 調整逾時、重試、等待時間與自動判斷條件
@@ -26,6 +27,7 @@ https://github.com/D4Vinci/Scrapling
 - [環境變數設定](#環境變數設定)
 - [API 使用方式](#api-使用方式)
 - [抓取模式](#抓取模式)
+- [自動內容展開與點擊模擬](#自動內容展開與點擊模擬)
 - [Auto 模式判斷方式](#auto-模式判斷方式)
 - [容器維護](#容器維護)
 - [常見問題](#常見問題)
@@ -42,13 +44,13 @@ FastAPI
     |
     +-- mode=static  ----> AsyncFetcher
     |
-    +-- mode=dynamic ----> DynamicFetcher
+    +-- mode=dynamic ----> DynamicFetcher (含點擊/展開互動)
     |
     +-- mode=auto
           |
           +-- 先使用 AsyncFetcher
           |
-          +-- 判斷為 JavaScript 空殼頁或內容過短
+          +-- 判斷為 JavaScript 空殼頁、內容過短或帶有點擊需求
                   |
                   +-- 改用 DynamicFetcher
     |
@@ -75,7 +77,7 @@ FROM pyd4vinci/scrapling
 
 WORKDIR /service
 
-RUN python -m pip install --no-cache-dir "scrapling[all]" fastapi "uvicorn[standard]" markdownify
+RUN python -m pip install --no-cache-dir "scrapling[all]" fastapi "uvicorn[standard]\" markdownify
 
 COPY main.py .
 
@@ -179,38 +181,12 @@ http://localhost:8080/docs
 | `DYNAMIC_DISABLE_RESOURCES` | `false` | 布林值 | 是否阻擋 CSS、圖片、字型等資源 |
 | `AUTO_MIN_HTML_LENGTH` | `1000` | 字元 | 靜態 HTML 少於此長度時，`auto` 模式改用動態抓取 |
 | `EXTRA_JS_SIGNALS` | 空白 | - | 額外的 JavaScript 頁面辨識關鍵字，以 `\|` 分隔 |
-
-布林值可使用：
-
-```text
-true / false
-1 / 0
-yes / no
-on / off
-```
-
-### 建議設定
-
-一般網站：
-
-```env
-DYNAMIC_TIMEOUT=30000
-DYNAMIC_WAIT=2000
-```
-
-104、myF5 等動態網站：
-
-```env
-DYNAMIC_TIMEOUT=60000
-DYNAMIC_WAIT=5000
-DYNAMIC_DISABLE_RESOURCES=false
-```
-
-很慢的網站：
-
-```env
-DYNAMIC_TIMEOUT=90000
-```
+| `AUTO_EXPAND_DEFAULT` | `true` | 布林值 | 是否預設啟動自動內容展開功能 |
+| `AUTO_EXPAND_KEYWORDS` | (內建列表) | - | 觸發點擊的關鍵字列表，以 `\|` 分隔 |
+| `AUTO_EXPAND_WAIT_TIMEOUT` | `15000` | 毫秒 | 等待展開按鍵出現的最長時間 |
+| `AUTO_EXPAND_AFTER_CLICK_WAIT` | `1000` | 毫秒 | 點擊按鈕後，額外等待資料載入的時間 |
+| `MAX_CLICK_SELECTORS` | `20` | 次 | 單次請求允許手動提供的 CSS Selector 數量上限 |
+| `MAX_CLICKS_PER_SELECTOR` | `20` | 次 | 每個 Selector 最多連續點擊次數 |
 
 ## API 使用方式
 
@@ -238,40 +214,27 @@ JSON Body：
 | 欄位 | 必填 | 預設值 | 可用值 | 說明 |
 | --- | --- | --- | --- | --- |
 | `url` | 是 | 無 | HTTP 或 HTTPS URL | 要抓取的目標網址 |
-| `mode` | 否 | `auto` | `auto`、`static`、`dynamic` | 抓取模式 |
-| `response_format` | 否 | `json` | `json`、`markdown` | 回應格式 |
+| `mode` | 否 | `auto` | `auto`, `static`, `dynamic` | 抓取模式 |
+| `response_format` | 否 | `json` | `json`, `markdown` | 回應格式 |
+| `auto_expand` | 否 | `true` | 布林值 | 針對此請求是否執行自動展開 (僅動態模式有效) |
+| `click_selectors` | 否 | `[]` | List[str] | 手動指定要點擊的 CSS Selectors |
 
-### 回傳 Markdown
+### 綜合使用範例 (含點擊模擬)
 
-```bash
-curl -X POST http://localhost:8080/scrape \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: YOUR_API_KEY" \
-  -d '{"url":"https://www.104.com.tw/job/7rnd9","mode":"auto","response_format":"markdown"}'
-```
-
-### 回傳 JSON
+針對需要展開才能看到內容的頁面：
 
 ```bash
 curl -X POST http://localhost:8080/scrape \
   -H "Content-Type: application/json" \
   -H "x-api-key: YOUR_API_KEY" \
-  -d '{"url":"https://example.com","mode":"auto","response_format":"json"}'
+  -d '{
+    "url": "https://example.com/job-info",
+    "mode": "auto",
+    "auto_expand": true,
+    "click_selectors": [".more-info-btn", "#details-tab"],
+    "response_format": "markdown"
+  }'
 ```
-
-JSON 回應範例：
-
-```json
-{
-  "success": true,
-  "url": "https://example.com/",
-  "status": 200,
-  "mode": "static",
-  "markdown": "..."
-}
-```
-
-回應中的 `mode` 代表最後實際使用的抓取模式。
 
 ## 抓取模式
 
@@ -280,38 +243,30 @@ JSON 回應範例：
 一般使用建議選擇此模式。
 
 1. 先使用 `AsyncFetcher` 進行靜態抓取。
-2. 檢查 HTML 是否像 JavaScript 空殼頁。
-3. 如果命中辨識關鍵字，或 HTML 長度少於 `AUTO_MIN_HTML_LENGTH`，改用 `DynamicFetcher`。
+2. 檢查 HTML 是否包含 JavaScript 提示關鍵字或長度是否過短。
+3. **若請求內帶有 `click_selectors`**，或者命中上述條件，系統會自動切換為 `DynamicFetcher` 進行瀏覽器模擬。
 
 ### `static`
 
 只使用 `AsyncFetcher`。
 
-優點：
-
-- 速度快
-- 資源消耗低
-- 適合一般靜態網站
-
-限制：
-
-- 無法取得需要 JavaScript 渲染後才出現的內容
+優點：速度極快、資源消耗最低。
+限制：無法取得 JavaScript 渲染後的內容，且**不支援點擊模擬功能**。
 
 ### `dynamic`
 
 直接使用 `DynamicFetcher` 啟動瀏覽器抓取。
 
-優點：
+優點：適合 104、myF5、以及任何需要執行 JS 點擊或等待資源載入的網站。
+限制：速度較慢、資源消耗較高。
 
-- 適合 104、myF5 等 JavaScript 動態網站
-- 可等待頁面資源與動態內容載入
+## 自動內容展開與點擊模擬
 
-限制：
+本服務專門為「抓取完整文章」設計了互動機制：
 
-- 速度較慢
-- CPU 與記憶體使用量較高
-
-> 此版本的流程是「靜態判斷一次，必要時完整動態抓取一次」，沒有 `dynamic_fast` 或 `dynamic_full` 兩段式流程。
+- **自動展開**：會尋找頁面中符合關鍵字（如 `show more`, `read more`, `applies to`）且具備屬性 `aria-expanded="false"` 的按鈕自動點擊。
+- **手動點擊**：透過 `click_selectors` 參數，你可以精準控制瀏覽器點擊特定的 UI 元素（例如多個分頁標籤、載入更多按鈕等）。
+- **流程保護**：系統會透過 `MAX_CLICKS_PER_SELECTOR` 與超時機制保護，防止網頁因異常 Selector 導致無限點擊或佔用過多資源。
 
 ## Auto 模式判斷方式
 
@@ -328,53 +283,13 @@ css error
 sorry to interrupt
 ```
 
-遇到新的網站提示文字時，可在 `.env` 加入額外關鍵字：
-
-```env
-EXTRA_JS_SIGNALS=javascript required|please turn on javascript|app loading failed
-```
-
-注意事項：
-
-- 多個關鍵字使用 `|` 分隔
-- 比對不分大小寫
-- 不建議使用逗號分隔，因為網站文字本身可能包含逗號
-
-如果靜態頁面仍未被辨識為 JavaScript 空殼頁，可以：
-
-1. 將該頁面的特有提示文字加入 `EXTRA_JS_SIGNALS`
-2. 適度提高 `AUTO_MIN_HTML_LENGTH`
-3. 呼叫 API 時直接指定 `"mode":"dynamic"`
+遇到新的網站提示文字時，可在 `.env` 加入額外關鍵字設定 `EXTRA_JS_SIGNALS`。
 
 ## 容器維護
 
-### 查看狀態
-
-```bash
-docker compose ps
-```
-
-### 查看日誌
-
-```bash
-docker logs --tail=100 scrapling-api
-```
-
-即時追蹤日誌：
-
-```bash
-docker logs -f scrapling-api
-```
-
-### 停止服務
-
-```bash
-docker compose down
-```
-
 ### 修改 `.env` 後套用設定
 
-只修改 `.env` 時，不需要重新建立 image，但必須重新建立容器，環境變數才會重新載入。
+只修改 `.env` 時，不需要重新建立 image，但必須重新建立容器：
 
 ```bash
 docker compose up -d --force-recreate
@@ -382,111 +297,14 @@ docker compose up -d --force-recreate
 
 ### 修改 `main.py` 或 `Dockerfile` 後重新建立
 
-`Dockerfile` 使用 `COPY main.py .`，因此修改 `main.py` 後必須重新 build。
-
 ```bash
 docker compose up -d --build
-```
-
-### 不使用快取重新建立
-
-只有遇到依賴安裝或 image 快取問題時，才建議使用：
-
-```bash
-docker compose build --no-cache
-docker compose up -d
-```
-
-## 本機直接執行
-
-若不使用 Docker，需要自行安裝 FastAPI、Uvicorn、Markdownify、Pydantic、Scrapling，以及 `DynamicFetcher` 所需的瀏覽器元件。
-
-`main.py` 不會自行載入 `.env`，啟動 Uvicorn 時必須指定 `--env-file`：
-
-```bash
-uvicorn main:app --host 0.0.0.0 --port 8080 --env-file .env
 ```
 
 ## 常見問題
 
 ### `401 Invalid API key`
+原因：請求 Header 的 `x-api-key` 與伺服器設定不一致。
 
-原因：請求 Header 的 `x-api-key` 與 `.env` 中的 `API_KEY` 不一致。
-
-處理方式：
-
-```bash
-curl -H "x-api-key: YOUR_API_KEY" ...
-```
-
-### `400 Invalid mode`
-
-`mode` 只能使用：
-
-```text
-auto
-static
-dynamic
-```
-
-### `400 Invalid response_format`
-
-`response_format` 只能使用：
-
-```text
-json
-markdown
-```
-
-### `API_KEY is required` 或容器一直重啟
-
-原因：程式啟動時沒有讀到 `API_KEY`。
-
-檢查項目：
-
-1. `.env` 是否與 `docker-compose.yml` 位於同一個目錄
-2. `docker-compose.yml` 是否包含 `env_file: .env`
-3. `.env` 是否設定非空白的 `API_KEY`
-
-修改後重新建立容器：
-
-```bash
-docker compose up -d --force-recreate
-```
-
-### `ModuleNotFoundError: No module named 'curl_cffi'`
-
-原因：Scrapling 的完整依賴沒有安裝，或 image 使用了舊快取。
-
-處理方式：
-
-```bash
-docker compose build --no-cache
-docker compose up -d
-```
-
-### `auto` 模式回傳 `CSS Error`、`Loading` 或 JavaScript 提示
-
-處理方式：
-
-1. 將頁面特有文字加入 `EXTRA_JS_SIGNALS`
-2. 提高 `AUTO_MIN_HTML_LENGTH`
-3. 直接使用 `"mode":"dynamic"`
-4. 確認 `DYNAMIC_DISABLE_RESOURCES=false`
-
-### 動態頁面抓取逾時
-
-將 `.env` 調整為：
-
-```env
-DYNAMIC_TIMEOUT=60000
-DYNAMIC_WAIT=5000
-```
-
-很慢的網站可嘗試：
-
-```env
-DYNAMIC_TIMEOUT=90000
-```
-
-
+### `auto` 模式回傳 `CSS Error`、`Loading` 或不完整
+處理方式：提高 `AUTO_MIN_HTML_LENGTH` 或將該頁面特有文字加入 `EXTRA_JS_SIGNALS`，也可以直接強制使用 `"mode":"dynamic"` 並視情況設定 `auto_expand: true`。
