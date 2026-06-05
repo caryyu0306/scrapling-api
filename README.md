@@ -4,6 +4,10 @@
 
 此服務支援靜態抓取、JavaScript 動態頁面抓取，以及自動判斷模式，適合提供給 n8n、內部工具或其他程式呼叫。
 
+
+https://scrapling.readthedocs.io/en/latest/index.html
+https://github.com/D4Vinci/Scrapling
+
 ## 功能特色
 
 - 支援靜態頁面與 JavaScript 動態頁面
