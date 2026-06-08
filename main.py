@@ -116,6 +116,10 @@ AUTO_EXPAND_WAIT_TIMEOUT = env_int("AUTO_EXPAND_WAIT_TIMEOUT", 15000)
 AUTO_EXPAND_AFTER_CLICK_WAIT = env_int("AUTO_EXPAND_AFTER_CLICK_WAIT", 1000)
 MAX_CLICK_SELECTORS = env_int("MAX_CLICK_SELECTORS", 20)
 MAX_CLICKS_PER_SELECTOR = env_int("MAX_CLICKS_PER_SELECTOR", 20)
+MAX_INPUT_SELECTORS = env_int("MAX_INPUT_SELECTORS", 20)
+MAX_INPUT_VALUE_LENGTH = env_int("MAX_INPUT_VALUE_LENGTH", 2000)
+FORM_ACTION_TIMEOUT = env_int("FORM_ACTION_TIMEOUT", 15000)
+MAX_WAIT_AFTER_ACTIONS = env_int("MAX_WAIT_AFTER_ACTIONS", 60000)
 
 CLEAN_CONTENT_DEFAULT = env_bool("CLEAN_CONTENT_DEFAULT", True)
 MAX_CLEANING_SELECTORS = env_int("MAX_CLEANING_SELECTORS", 50)
@@ -194,7 +198,10 @@ class ScrapeRequest(BaseModel):
     mode: str = "auto"  # auto / static / dynamic
     response_format: str = "json"  # json / markdown
     auto_expand: bool = AUTO_EXPAND_DEFAULT
+    input_values: dict[str, str] = Field(default_factory=dict)
     click_selectors: list[str] = Field(default_factory=list)
+    wait_for_selector: str | None = None
+    wait_after_actions: int = 0
     clean_content: bool = CLEAN_CONTENT_DEFAULT
     content_selector: str | None = None
     remove_selectors: list[str] = Field(default_factory=list)
@@ -272,7 +279,13 @@ async def fetch_static(url: str, user_agent: str | None):
 
 async def click_visible_elements(page, selector: str) -> int:
     clicked = 0
-    elements = await page.locator(selector).all()
+    try:
+        elements = await page.locator(selector).all()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid click selector: {selector}",
+        ) from exc
 
     for element in elements[:MAX_CLICKS_PER_SELECTOR]:
         if await element.is_visible():
@@ -280,6 +293,38 @@ async def click_visible_elements(page, selector: str) -> int:
             clicked += 1
 
     return clicked
+
+
+async def fill_input_values(page, input_values: dict[str, str]) -> int:
+    filled = 0
+
+    for selector, value in input_values.items():
+        try:
+            target = page.locator(selector).first
+            await target.wait_for(state="visible", timeout=FORM_ACTION_TIMEOUT)
+            await target.fill(value)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid or unavailable input selector: {selector}",
+            ) from exc
+
+        filled += 1
+
+    return filled
+
+
+async def wait_for_dynamic_selector(page, selector: str) -> None:
+    try:
+        await page.locator(selector).first.wait_for(
+            state="visible",
+            timeout=FORM_ACTION_TIMEOUT,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"wait_for_selector did not appear: {selector}",
+        ) from exc
 
 
 async def expand_common_content(page) -> int:
@@ -313,10 +358,14 @@ async def expand_common_content(page) -> int:
 async def fetch_dynamic(
     url: str,
     auto_expand: bool,
+    input_values: dict[str, str],
     click_selectors: list[str],
+    wait_for_selector: str | None,
+    wait_after_actions: int,
     user_agent: str | None,
 ):
     async def interact_with_page(page):
+        filled = await fill_input_values(page, input_values)
         clicked = 0
 
         if auto_expand:
@@ -325,7 +374,12 @@ async def fetch_dynamic(
         for selector in click_selectors:
             clicked += await click_visible_elements(page, selector)
 
-        if clicked:
+        if wait_for_selector:
+            await wait_for_dynamic_selector(page, wait_for_selector)
+
+        if wait_after_actions:
+            await page.wait_for_timeout(wait_after_actions)
+        elif clicked or filled:
             await page.wait_for_timeout(AUTO_EXPAND_AFTER_CLICK_WAIT)
 
     try:
@@ -460,12 +514,29 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
     url = str(req.url)
     mode = req.mode.lower()
     response_format = req.response_format.lower()
+    input_values = {
+        selector.strip(): value
+        for selector, value in req.input_values.items()
+        if selector.strip()
+    }
     click_selectors = [selector.strip() for selector in req.click_selectors if selector.strip()]
+    wait_for_selector = (
+        req.wait_for_selector.strip()
+        if req.wait_for_selector and req.wait_for_selector.strip()
+        else None
+    )
+    wait_after_actions = req.wait_after_actions
     remove_selectors = [
         selector.strip()
         for selector in req.remove_selectors
         if selector.strip()
     ]
+    needs_dynamic_interaction = bool(
+        input_values
+        or click_selectors
+        or wait_for_selector
+        or wait_after_actions
+    )
 
     if mode not in {"auto", "static", "dynamic"}:
         raise HTTPException(status_code=400, detail="Invalid mode")
@@ -473,10 +544,35 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
     if response_format not in {"json", "markdown"}:
         raise HTTPException(status_code=400, detail="Invalid response_format")
 
+    if len(input_values) > MAX_INPUT_SELECTORS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many input_values; maximum is {MAX_INPUT_SELECTORS}",
+        )
+
+    for selector, value in input_values.items():
+        if len(value) > MAX_INPUT_VALUE_LENGTH:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"input value for {selector} is too long; "
+                    f"maximum is {MAX_INPUT_VALUE_LENGTH}"
+                ),
+            )
+
     if len(click_selectors) > MAX_CLICK_SELECTORS:
         raise HTTPException(
             status_code=400,
             detail=f"Too many click_selectors; maximum is {MAX_CLICK_SELECTORS}",
+        )
+
+    if wait_after_actions < 0 or wait_after_actions > MAX_WAIT_AFTER_ACTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "wait_after_actions must be between 0 and "
+                f"{MAX_WAIT_AFTER_ACTIONS} milliseconds"
+            ),
         )
 
     if len(remove_selectors) > MAX_CLEANING_SELECTORS:
@@ -485,10 +581,10 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
             detail=f"Too many remove_selectors; maximum is {MAX_CLEANING_SELECTORS}",
         )
 
-    if mode == "static" and click_selectors:
+    if mode == "static" and needs_dynamic_interaction:
         raise HTTPException(
             status_code=400,
-            detail="click_selectors require auto or dynamic mode",
+            detail="form interactions require auto or dynamic mode",
         )
 
     try:
@@ -498,17 +594,25 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
             status, html, used_mode = await fetch_dynamic(
                 url,
                 req.auto_expand,
+                input_values,
                 click_selectors,
+                wait_for_selector,
+                wait_after_actions,
                 selected_user_agent,
             )
         else:
             status, html, used_mode = await fetch_static(url, selected_user_agent)
 
-            if mode == "auto" and (should_use_dynamic(html) or click_selectors):
+            if mode == "auto" and (
+                should_use_dynamic(html) or needs_dynamic_interaction
+            ):
                 status, html, used_mode = await fetch_dynamic(
                     url,
                     req.auto_expand,
+                    input_values,
                     click_selectors,
+                    wait_for_selector,
+                    wait_after_actions,
                     selected_user_agent,
                 )
 
