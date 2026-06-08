@@ -57,9 +57,19 @@ def env_list(name: str, default: str) -> list[str]:
     return [item.strip() for item in value.split("|") if item.strip()]
 
 
+def env_optional(name: str) -> str | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+
+    return value.strip() or None
+
+
 API_KEY = os.getenv("API_KEY")
 if not API_KEY:
     raise RuntimeError("API_KEY is required")
+
+SCRAPLING_PROXY = env_optional("SCRAPLING_PROXY")
 
 STATIC_TIMEOUT = env_int("STATIC_TIMEOUT", 20)
 STATIC_RETRIES = env_int("STATIC_RETRIES", 2)
@@ -271,6 +281,7 @@ async def fetch_static(url: str, user_agent: str | None):
         retries=STATIC_RETRIES,
         stealthy_headers=STATIC_STEALTHY_HEADERS,
         headers=build_request_headers(user_agent),
+        proxy=SCRAPLING_PROXY,
     )
 
     html = page.body.decode("utf-8", errors="ignore")
@@ -401,6 +412,7 @@ async def fetch_dynamic(
             locale=DYNAMIC_LOCALE if DYNAMIC_STEALTH_BASIC else None,
             timezone_id=DYNAMIC_TIMEZONE if DYNAMIC_STEALTH_BASIC else None,
             extra_headers=build_request_headers(None),
+            proxy=SCRAPLING_PROXY,
             extra_flags=DYNAMIC_EXTRA_FLAGS if DYNAMIC_STEALTH_BASIC else None,
             additional_args=build_dynamic_additional_args(),
             timeout=DYNAMIC_TIMEOUT,
