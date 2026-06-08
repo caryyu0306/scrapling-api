@@ -21,6 +21,7 @@ https://scrapling.readthedocs.io/en/latest/index.html
 - **併發保護**：使用 Semaphore 限制同時執行的 DynamicFetcher 數量，避免瀏覽器併發拖垮 Docker 主機
 - **User-Agent 輪換**：每次 `/scrape` 請求自動挑選 User-Agent，且 `auto` fallback 會沿用同一個 UA
 - **Basic stealth**：在 dynamic 模式加入語系、時區、viewport、Chromium flag 與 `navigator.webdriver` 隱藏
+- **全域 Proxy**：可透過 `.env` 設定 `SCRAPLING_PROXY`，同時套用到 static 與 dynamic 抓取；未設定時維持直連
 - 支援 JSON 或純 Markdown 回應格式
 - 使用 `x-api-key` Header 進行簡單 API 驗證
 - 可透過 `.env` 調整逾時、重試、等待時間與自動判斷條件
@@ -37,6 +38,7 @@ https://scrapling.readthedocs.io/en/latest/index.html
 - [內容清理與主體萃取](#內容清理與主體萃取)
 - [Dynamic 併發與排隊控制](#dynamic-併發與排隊控制)
 - [User-Agent 輪換與 Basic Stealth](#user-agent-輪換與-basic-stealth)
+- [Proxy 設定](#proxy-設定)
 - [Dynamic 表單互動、內容展開與點擊模擬](#dynamic-表單互動內容展開與點擊模擬)
 - [Auto 模式判斷方式](#auto-模式判斷方式)
 - [容器維護](#容器維護)
@@ -53,6 +55,8 @@ Client
 FastAPI
     |
     +-- 每次請求挑選 User-Agent
+    |
+    +-- 若 SCRAPLING_PROXY 有設定，static / dynamic 會走同一組 proxy
     |
     +-- mode=static  ----> AsyncFetcher
     |
@@ -143,10 +147,12 @@ cd ~/scrapling-api
 
 ```env
 API_KEY=replace-with-a-long-random-secret
+SCRAPLING_PROXY=
 DYNAMIC_TIMEOUT=60000
 ```
 
 > 不要使用 `123456` 等容易猜測的密鑰，也不要將正式 `.env` 上傳到 GitHub。
+> `SCRAPLING_PROXY` 留空代表不使用 proxy，服務會直接使用容器或主機預設網路出口。
 
 ### 3. 建立並啟動容器
 
@@ -186,6 +192,7 @@ http://localhost:8080/docs
 | 參數 | 預設值 | 單位 | 說明 |
 | --- | ---: | --- | --- |
 | `API_KEY` | 無 | - | API 驗證密鑰，呼叫時必須放在 `x-api-key` Header |
+| `SCRAPLING_PROXY` | 空白 | - | 全服務層級 proxy URL；留空時不使用 proxy，static 與 dynamic 都走預設直連 |
 | `STATIC_TIMEOUT` | `20` | 秒 | 靜態抓取等待回應的最長時間 |
 | `STATIC_RETRIES` | `2` | 次 | 靜態抓取失敗時的重試次數 |
 | `STATIC_STEALTHY_HEADERS` | `true` | 布林值 | 靜態抓取是否加入類似瀏覽器的 HTTP Headers |
@@ -435,6 +442,46 @@ basic stealth 會做以下低成本強化：
 6. 在頁面載入前注入 script，讓 `navigator.webdriver` 回傳 `undefined`。
 
 這不是 Captcha solver，也不會保證繞過進階反爬。它的目標是降低常見自動化破綻；如果目標站檢查 Canvas、WebGL、TLS fingerprint、IP reputation 或行為軌跡，仍需要進一步使用 StealthyFetcher、proxy/session 策略或人工授權流程。
+
+## Proxy 設定
+
+本服務支援使用 `.env` 的 `SCRAPLING_PROXY` 設定全服務層級 proxy。設定後，`static` 模式的 `AsyncFetcher` 與 `dynamic` 模式的 `DynamicFetcher` 都會走同一組 proxy；`auto` 模式若從 static fallback 到 dynamic，也會沿用同一組 proxy。
+
+預設設定：
+
+```env
+SCRAPLING_PROXY=
+```
+
+`SCRAPLING_PROXY` 留空或完全不設定時，程式會將它視為 `None`，Scrapling 會使用容器或主機的預設網路出口直連，不會自動套用任何 proxy。
+
+若要啟用 proxy，填入完整 proxy URL：
+
+```env
+SCRAPLING_PROXY=http://username:password@proxy.example.com:8000
+```
+
+常見格式：
+
+```env
+SCRAPLING_PROXY=http://username:password@host:port
+SCRAPLING_PROXY=https://username:password@host:port
+SCRAPLING_PROXY=http://host:port
+```
+
+如果帳號或密碼包含 `@`、`:`、`/`、`#`、空白等特殊字元，請先做 URL encode，避免 URL 被解析錯誤。例如密碼中的 `@` 應寫成 `%40`。
+
+安全建議：
+
+1. 建議只用 `.env` 控制 proxy，不要把 proxy 開放成 `/scrape` request body 參數，避免 API 被外部呼叫端濫用成開放代理。
+2. 不要將正式 proxy 帳密提交到 GitHub；正式部署請使用私有 `.env`、Docker secret、CI secret 或主機環境變數。
+3. 若 proxy 發生連線失敗、認證失敗或目標站封鎖，API 會回傳抓取例外；可先移除 `SCRAPLING_PROXY` 確認直連是否正常，再檢查 proxy 供應商、地區與帳密。
+
+修改 `.env` 後，需重新建立容器讓環境變數生效：
+
+```bash
+docker compose up -d --force-recreate
+```
 
 ## Dynamic 表單互動、內容展開與點擊模擬
 
