@@ -21,7 +21,7 @@ https://scrapling.readthedocs.io/en/latest/index.html
 - **併發保護**：使用 Semaphore 限制同時執行的 DynamicFetcher 數量，避免瀏覽器併發拖垮 Docker 主機
 - **User-Agent 輪換**：每次 `/scrape` 請求自動挑選 User-Agent，且 `auto` fallback 會沿用同一個 UA
 - **Basic stealth**：在 dynamic 模式加入語系、時區、viewport、Chromium flag 與 `navigator.webdriver` 隱藏
-- **全域 Proxy**：可透過 `.env` 設定 `SCRAPLING_PROXY`，同時套用到 static 與 dynamic 抓取；未設定時維持直連
+- **Proxy 支援**：可在 `/scrape` request body 指定單次 proxy；未指定時使用 `.env` 的 `SCRAPLING_PROXY`，兩者都沒有時維持直連
 - 支援 JSON 或純 Markdown 回應格式
 - 使用 `x-api-key` Header 進行簡單 API 驗證
 - 可透過 `.env` 調整逾時、重試、等待時間與自動判斷條件
@@ -56,7 +56,7 @@ FastAPI
     |
     +-- 每次請求挑選 User-Agent
     |
-    +-- 若 SCRAPLING_PROXY 有設定，static / dynamic 會走同一組 proxy
+    +-- 決定 proxy：body.proxy -> SCRAPLING_PROXY -> 直連
     |
     +-- mode=static  ----> AsyncFetcher
     |
@@ -148,11 +148,12 @@ cd ~/scrapling-api
 ```env
 API_KEY=replace-with-a-long-random-secret
 SCRAPLING_PROXY=
+ALLOW_REQUEST_PROXY=true
 DYNAMIC_TIMEOUT=60000
 ```
 
 > 不要使用 `123456` 等容易猜測的密鑰，也不要將正式 `.env` 上傳到 GitHub。
-> `SCRAPLING_PROXY` 留空代表不使用 proxy，服務會直接使用容器或主機預設網路出口。
+> `SCRAPLING_PROXY` 留空代表沒有全域預設 proxy；如果 `/scrape` body 也沒有傳 `proxy`，服務會直接使用容器或主機預設網路出口。
 
 ### 3. 建立並啟動容器
 
@@ -192,7 +193,8 @@ http://localhost:8080/docs
 | 參數 | 預設值 | 單位 | 說明 |
 | --- | ---: | --- | --- |
 | `API_KEY` | 無 | - | API 驗證密鑰，呼叫時必須放在 `x-api-key` Header |
-| `SCRAPLING_PROXY` | 空白 | - | 全服務層級 proxy URL；留空時不使用 proxy，static 與 dynamic 都走預設直連 |
+| `SCRAPLING_PROXY` | 空白 | - | 全服務層級預設 proxy URL；request body 沒有傳 `proxy` 時才會使用；留空時預設直連 |
+| `ALLOW_REQUEST_PROXY` | `true` | 布林值 | 是否允許 `/scrape` request body 使用 `proxy` 欄位；設為 `false` 時只能使用 `SCRAPLING_PROXY` 或直連 |
 | `STATIC_TIMEOUT` | `20` | 秒 | 靜態抓取等待回應的最長時間 |
 | `STATIC_RETRIES` | `2` | 次 | 靜態抓取失敗時的重試次數 |
 | `STATIC_STEALTHY_HEADERS` | `true` | 布林值 | 靜態抓取是否加入類似瀏覽器的 HTTP Headers |
@@ -259,6 +261,7 @@ JSON Body：
 | `url` | 是 | 無 | HTTP 或 HTTPS URL | 要抓取的目標網址 |
 | `mode` | 否 | `auto` | `auto`, `static`, `dynamic` | 抓取模式 |
 | `response_format` | 否 | `json` | `json`, `markdown` | 回應格式 |
+| `proxy` | 否 | `null` | Proxy URL | 單次請求使用的 proxy；有填時優先於 `.env` 的 `SCRAPLING_PROXY`，沒填時使用 `SCRAPLING_PROXY` 或直連 |
 | `auto_expand` | 否 | `true` | 布林值 | 針對此請求是否執行自動展開 (僅動態模式有效) |
 | `input_values` | 否 | `{}` | Dict[str, str] | dynamic 模式中要填入的表單欄位，key 為 CSS Selector，value 為填入內容 |
 | `click_selectors` | 否 | `[]` | List[str] | 手動指定要點擊的 CSS Selectors |
@@ -445,17 +448,63 @@ basic stealth 會做以下低成本強化：
 
 ## Proxy 設定
 
-本服務支援使用 `.env` 的 `SCRAPLING_PROXY` 設定全服務層級 proxy。設定後，`static` 模式的 `AsyncFetcher` 與 `dynamic` 模式的 `DynamicFetcher` 都會走同一組 proxy；`auto` 模式若從 static fallback 到 dynamic，也會沿用同一組 proxy。
+本服務支援兩種 proxy 設定方式：
+
+1. 單次請求 proxy：在 `/scrape` request body 傳入 `proxy`。
+2. 全域預設 proxy：在 `.env` 設定 `SCRAPLING_PROXY`。
+
+實際使用優先順序固定為：
+
+```text
+body.proxy -> SCRAPLING_PROXY -> 直連本機/容器預設出口
+```
+
+也就是說，呼叫端有傳 `proxy` 時，該次請求會使用 body 內的 proxy；沒有傳、傳空字串或 `null` 時，才會 fallback 到 `.env` 的 `SCRAPLING_PROXY`；如果 `.env` 也沒有設定，就直接使用容器或主機的預設網路出口。
+
+這個 proxy 會同時套用到 `static` 模式的 `AsyncFetcher` 與 `dynamic` 模式的 `DynamicFetcher`。`auto` 模式若從 static fallback 到 dynamic，也會沿用同一組 proxy。
 
 預設設定：
 
 ```env
 SCRAPLING_PROXY=
+ALLOW_REQUEST_PROXY=true
 ```
 
-`SCRAPLING_PROXY` 留空或完全不設定時，程式會將它視為 `None`，Scrapling 會使用容器或主機的預設網路出口直連，不會自動套用任何 proxy。
+`ALLOW_REQUEST_PROXY=true` 代表允許呼叫端在 request body 內傳入 `proxy`。若部署成公開 API、不希望外部呼叫端自行指定 proxy，可改成：
 
-若要啟用 proxy，填入完整 proxy URL：
+```env
+ALLOW_REQUEST_PROXY=false
+```
+
+此時如果 request body 仍傳入 `proxy`，API 會回傳 `400 Request body proxy is disabled by ALLOW_REQUEST_PROXY`。
+
+### 單次請求使用 proxy
+
+```bash
+curl -X POST http://localhost:8080/scrape \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -d '{
+    "url": "https://example.com",
+    "mode": "auto",
+    "proxy": "http://username:password@proxy.example.com:8000"
+  }'
+```
+
+### 沒填 proxy 時直連
+
+如果 request body 沒有 `proxy`，且 `.env` 的 `SCRAPLING_PROXY` 也留空，Scrapling 會使用容器或主機的預設網路出口直連。
+
+```json
+{
+  "url": "https://example.com",
+  "mode": "auto"
+}
+```
+
+### 設定全域預設 proxy
+
+若希望所有未指定 `proxy` 的請求都走同一組預設 proxy，可在 `.env` 填入完整 proxy URL：
 
 ```env
 SCRAPLING_PROXY=http://username:password@proxy.example.com:8000
@@ -473,9 +522,10 @@ SCRAPLING_PROXY=http://host:port
 
 安全建議：
 
-1. 建議只用 `.env` 控制 proxy，不要把 proxy 開放成 `/scrape` request body 參數，避免 API 被外部呼叫端濫用成開放代理。
-2. 不要將正式 proxy 帳密提交到 GitHub；正式部署請使用私有 `.env`、Docker secret、CI secret 或主機環境變數。
-3. 若 proxy 發生連線失敗、認證失敗或目標站封鎖，API 會回傳抓取例外；可先移除 `SCRAPLING_PROXY` 確認直連是否正常，再檢查 proxy 供應商、地區與帳密。
+1. 自用或內部 n8n 使用時，通常可以保持 `ALLOW_REQUEST_PROXY=true`，讓每次 API 呼叫自行決定 proxy。
+2. 若 API 會暴露給不可信任的外部呼叫端，建議設為 `ALLOW_REQUEST_PROXY=false`，避免服務被拿來測試 proxy、繞路抓取或消耗瀏覽器資源。
+3. 不要將正式 proxy 帳密提交到 GitHub；正式部署請使用私有 `.env`、Docker secret、CI secret 或主機環境變數。
+4. 若 proxy 發生連線失敗、認證失敗或目標站封鎖，API 會回傳抓取例外；可先移除 body `proxy` 與 `SCRAPLING_PROXY` 確認直連是否正常，再檢查 proxy 供應商、地區與帳密。
 
 修改 `.env` 後，需重新建立容器讓環境變數生效：
 
