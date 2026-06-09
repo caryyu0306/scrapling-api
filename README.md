@@ -270,6 +270,7 @@ JSON Body：
 | `url` | 是 | 無 | HTTP 或 HTTPS URL | 要抓取的目標網址 |
 | `mode` | 否 | `auto` | `auto`, `static`, `dynamic` | 抓取模式 |
 | `response_format` | 否 | `json` | `json`, `markdown` | 回應格式 |
+| `extract_source` | 否 | `html` | `html`, `visible_text` | 轉換來源；`html` 保留 Markdown 結構，`visible_text` 使用瀏覽器/HTML 可見文字 |
 | `proxy` | 否 | `null` | Proxy URL | 單次請求使用的 proxy；有填時優先於 `.env` 的 `SCRAPLING_PROXY`，沒填時使用 `SCRAPLING_PROXY` 或直連 |
 | `auto_expand` | 否 | `true` | 布林值 | 針對此請求是否執行自動展開 (僅動態模式有效) |
 | `input_values` | 否 | `{}` | Dict[str, str] | dynamic 模式中要填入的表單欄位，key 為 CSS Selector，value 為填入內容 |
@@ -374,7 +375,7 @@ n8n HTTP Request body 可直接使用：
 預設清理流程：
 
 1. 移除註解、`script`、`style`、`nav`、`footer`、`aside`、`iframe`、表單與按鈕等節點。
-2. 移除常見噪音 selector，例如 `.ads`、`.cookie-banner`、`.sidebar`、`.social-share`、`.related-posts`。
+2. 移除常見噪音 selector，例如 hidden/aria-hidden 節點、`.ads`、`.cookie-banner`、`.sidebar`、`.social-share`、`.related-posts`。
 3. 從 `article`、`main`、`[role='main']`、`.entry-content` 等候選節點中挑出文字量最多的主體內容。
 4. 將清理後的 HTML 轉成 Markdown，並壓縮多餘空白行。
 
@@ -390,6 +391,23 @@ n8n HTTP Request body 可直接使用：
 ```
 
 如果特殊網站需要完整原始 HTML 轉 Markdown，可傳入 `"clean_content": false` 關閉清理。
+
+### 可視文字抽取
+
+預設 `extract_source: "html"` 會把清理後的 HTML 交給 Markdownify，適合一般文章，能保留標題、連結與清單結構。
+
+少數 JavaScript-heavy 網站會在 DOM 內放入大量 framework data、隱藏節點或範例片段，導致 Markdownify 抽到不是畫面主體的內容。這類頁面可改用 `extract_source: "visible_text"`：
+
+```json
+{
+  "url": "https://my.f5.com/manage/s/article/K02024845",
+  "mode": "dynamic",
+  "extract_source": "visible_text",
+  "response_format": "markdown"
+}
+```
+
+在 `dynamic` 模式下，`visible_text` 會優先使用瀏覽器載入與互動完成後的 `body.innerText`；在 `static` 模式或瀏覽器文字不可用時，會從清理後 HTML 取純文字。這個模式不會保留完整 Markdown 結構，但能避開隱藏 DOM、Salesforce/Aura 類 framework data 造成的錯誤抽取。
 
 ## 文字正規化
 
