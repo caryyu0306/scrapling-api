@@ -2,7 +2,14 @@ FROM pyd4vinci/scrapling
 
 WORKDIR /service
 
-RUN python -m pip install --no-cache-dir "scrapling[all]" fastapi "uvicorn[standard]" markdownify beautifulsoup4
+RUN python -m pip install --no-cache-dir \
+    "scrapling[all]" \
+    fastapi \
+    "uvicorn[standard]" \
+    markdownify \
+    beautifulsoup4 \
+    charset-normalizer \
+    ftfy
 
 COPY main.py .
 
