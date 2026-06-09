@@ -57,9 +57,20 @@ def env_list(name: str, default: str) -> list[str]:
     return [item.strip() for item in value.split("|") if item.strip()]
 
 
+def env_optional(name: str) -> str | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+
+    return value.strip() or None
+
+
 API_KEY = os.getenv("API_KEY")
 if not API_KEY:
     raise RuntimeError("API_KEY is required")
+
+SCRAPLING_PROXY = env_optional("SCRAPLING_PROXY")
+ALLOW_REQUEST_PROXY = env_bool("ALLOW_REQUEST_PROXY", True)
 
 STATIC_TIMEOUT = env_int("STATIC_TIMEOUT", 20)
 STATIC_RETRIES = env_int("STATIC_RETRIES", 2)
@@ -197,6 +208,7 @@ class ScrapeRequest(BaseModel):
     url: HttpUrl
     mode: str = "auto"  # auto / static / dynamic
     response_format: str = "json"  # json / markdown
+    proxy: str | None = None
     auto_expand: bool = AUTO_EXPAND_DEFAULT
     input_values: dict[str, str] = Field(default_factory=dict)
     click_selectors: list[str] = Field(default_factory=list)
@@ -264,13 +276,25 @@ async def setup_stealth_page(page) -> None:
     )
 
 
-async def fetch_static(url: str, user_agent: str | None):
+def select_proxy(request_proxy: str | None) -> str | None:
+    proxy = request_proxy.strip() if request_proxy else None
+    if proxy and not ALLOW_REQUEST_PROXY:
+        raise HTTPException(
+            status_code=400,
+            detail="Request body proxy is disabled by ALLOW_REQUEST_PROXY",
+        )
+
+    return proxy or SCRAPLING_PROXY
+
+
+async def fetch_static(url: str, user_agent: str | None, proxy: str | None):
     page = await AsyncFetcher.get(
         url,
         timeout=STATIC_TIMEOUT,
         retries=STATIC_RETRIES,
         stealthy_headers=STATIC_STEALTHY_HEADERS,
         headers=build_request_headers(user_agent),
+        proxy=proxy,
     )
 
     html = page.body.decode("utf-8", errors="ignore")
@@ -363,6 +387,7 @@ async def fetch_dynamic(
     wait_for_selector: str | None,
     wait_after_actions: int,
     user_agent: str | None,
+    proxy: str | None,
 ):
     async def interact_with_page(page):
         filled = await fill_input_values(page, input_values)
@@ -401,6 +426,7 @@ async def fetch_dynamic(
             locale=DYNAMIC_LOCALE if DYNAMIC_STEALTH_BASIC else None,
             timezone_id=DYNAMIC_TIMEZONE if DYNAMIC_STEALTH_BASIC else None,
             extra_headers=build_request_headers(None),
+            proxy=proxy,
             extra_flags=DYNAMIC_EXTRA_FLAGS if DYNAMIC_STEALTH_BASIC else None,
             additional_args=build_dynamic_additional_args(),
             timeout=DYNAMIC_TIMEOUT,
@@ -589,6 +615,7 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
 
     try:
         selected_user_agent = choose_user_agent()
+        selected_proxy = select_proxy(req.proxy)
 
         if mode == "dynamic":
             status, html, used_mode = await fetch_dynamic(
@@ -599,9 +626,14 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
                 wait_for_selector,
                 wait_after_actions,
                 selected_user_agent,
+                selected_proxy,
             )
         else:
-            status, html, used_mode = await fetch_static(url, selected_user_agent)
+            status, html, used_mode = await fetch_static(
+                url,
+                selected_user_agent,
+                selected_proxy,
+            )
 
             if mode == "auto" and (
                 should_use_dynamic(html) or needs_dynamic_interaction
@@ -614,6 +646,7 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
                     wait_for_selector,
                     wait_after_actions,
                     selected_user_agent,
+                    selected_proxy,
                 )
 
         markdown_html = html
@@ -637,6 +670,7 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
             "url": url,
             "status": status,
             "mode": used_mode,
+            "proxy_enabled": selected_proxy is not None,
             "markdown": markdown,
         }
 
