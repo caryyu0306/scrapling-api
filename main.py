@@ -1,10 +1,14 @@
 import asyncio
+import html as html_lib
 import os
 import random
 import re
+import unicodedata
 
 from bs4 import BeautifulSoup, Comment
+from charset_normalizer import from_bytes
 from fastapi import FastAPI, Header, HTTPException
+from ftfy import fix_text
 from fastapi.responses import PlainTextResponse
 from markdownify import markdownify as md
 from pydantic import BaseModel, Field, HttpUrl
@@ -133,6 +137,7 @@ FORM_ACTION_TIMEOUT = env_int("FORM_ACTION_TIMEOUT", 15000)
 MAX_WAIT_AFTER_ACTIONS = env_int("MAX_WAIT_AFTER_ACTIONS", 60000)
 
 CLEAN_CONTENT_DEFAULT = env_bool("CLEAN_CONTENT_DEFAULT", True)
+NORMALIZE_TEXT_DEFAULT = env_bool("NORMALIZE_TEXT_DEFAULT", True)
 MAX_CLEANING_SELECTORS = env_int("MAX_CLEANING_SELECTORS", 50)
 CONTENT_MIN_TEXT_LENGTH = env_int("CONTENT_MIN_TEXT_LENGTH", 200)
 
@@ -215,6 +220,7 @@ class ScrapeRequest(BaseModel):
     wait_for_selector: str | None = None
     wait_after_actions: int = 0
     clean_content: bool = CLEAN_CONTENT_DEFAULT
+    normalize_text: bool = NORMALIZE_TEXT_DEFAULT
     content_selector: str | None = None
     remove_selectors: list[str] = Field(default_factory=list)
 
@@ -287,6 +293,34 @@ def select_proxy(request_proxy: str | None) -> str | None:
     return proxy or SCRAPLING_PROXY
 
 
+def decode_body(body: bytes) -> str:
+    detected = from_bytes(body).best()
+    if detected is not None:
+        return str(detected)
+
+    return body.decode("utf-8", errors="replace")
+
+
+def normalize_extracted_text(text: str) -> str:
+    text = html_lib.unescape(text)
+    text = fix_text(text)
+    text = unicodedata.normalize("NFC", text)
+
+    normalized_chars = []
+    for char in text:
+        category = unicodedata.category(char)
+        if category == "Zs":
+            normalized_chars.append(" ")
+        elif category == "Cf":
+            continue
+        else:
+            normalized_chars.append(char)
+
+    text = "".join(normalized_chars)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 async def fetch_static(url: str, user_agent: str | None, proxy: str | None):
     page = await AsyncFetcher.get(
         url,
@@ -297,7 +331,7 @@ async def fetch_static(url: str, user_agent: str | None, proxy: str | None):
         proxy=proxy,
     )
 
-    html = page.body.decode("utf-8", errors="ignore")
+    html = decode_body(page.body)
     return page.status, html, "static"
 
 
@@ -439,7 +473,7 @@ async def fetch_dynamic(
     finally:
         dynamic_semaphore.release()
 
-    html = page.body.decode("utf-8", errors="ignore")
+    html = decode_body(page.body)
     return page.status, html, "dynamic"
 
 
@@ -526,7 +560,10 @@ def clean_html_for_markdown(
     return str(content_root)
 
 
-def distill_markdown(markdown: str) -> str:
+def distill_markdown(markdown: str, normalize_text: bool) -> str:
+    if normalize_text:
+        markdown = normalize_extracted_text(markdown)
+
     markdown = "\n".join(line.rstrip() for line in markdown.splitlines())
     markdown = re.sub(r"\n{3,}", "\n\n", markdown)
     return markdown.strip()
@@ -657,7 +694,7 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
                 remove_selectors,
             )
 
-        markdown = distill_markdown(md(markdown_html))
+        markdown = distill_markdown(md(markdown_html), req.normalize_text)
 
         if response_format == "markdown":
             return PlainTextResponse(
