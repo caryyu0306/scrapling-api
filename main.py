@@ -1,10 +1,14 @@
 import asyncio
+import html as html_lib
 import os
 import random
 import re
+import unicodedata
 
 from bs4 import BeautifulSoup, Comment
+from charset_normalizer import from_bytes
 from fastapi import FastAPI, Header, HTTPException
+from ftfy import fix_text
 from fastapi.responses import PlainTextResponse
 from markdownify import markdownify as md
 from pydantic import BaseModel, Field, HttpUrl
@@ -133,6 +137,7 @@ FORM_ACTION_TIMEOUT = env_int("FORM_ACTION_TIMEOUT", 15000)
 MAX_WAIT_AFTER_ACTIONS = env_int("MAX_WAIT_AFTER_ACTIONS", 60000)
 
 CLEAN_CONTENT_DEFAULT = env_bool("CLEAN_CONTENT_DEFAULT", True)
+NORMALIZE_TEXT_DEFAULT = env_bool("NORMALIZE_TEXT_DEFAULT", True)
 MAX_CLEANING_SELECTORS = env_int("MAX_CLEANING_SELECTORS", 50)
 CONTENT_MIN_TEXT_LENGTH = env_int("CONTENT_MIN_TEXT_LENGTH", 200)
 
@@ -152,6 +157,8 @@ REMOVE_TAGS = env_list("REMOVE_TAGS", DEFAULT_REMOVE_TAGS)
 
 DEFAULT_REMOVE_SELECTORS = (
     "[role='navigation']|[role='banner']|[role='contentinfo']|[aria-hidden='true']|"
+    "[hidden]|[style*='display:none']|[style*='display: none']|"
+    "[style*='visibility:hidden']|[style*='visibility: hidden']|"
     ".ad|.ads|.advertisement|.banner|.cookie|.cookie-banner|.cookies|.footer|"
     ".menu|.nav|.navbar|.newsletter|.popup|.sidebar|.social-share|"
     ".subscribe|.related-posts|.recommended|#ad|#ads|#footer|#header|#nav|#sidebar"
@@ -208,6 +215,7 @@ class ScrapeRequest(BaseModel):
     url: HttpUrl
     mode: str = "auto"  # auto / static / dynamic
     response_format: str = "json"  # json / markdown
+    extract_source: str = "html"  # html / visible_text
     proxy: str | None = None
     auto_expand: bool = AUTO_EXPAND_DEFAULT
     input_values: dict[str, str] = Field(default_factory=dict)
@@ -215,6 +223,7 @@ class ScrapeRequest(BaseModel):
     wait_for_selector: str | None = None
     wait_after_actions: int = 0
     clean_content: bool = CLEAN_CONTENT_DEFAULT
+    normalize_text: bool = NORMALIZE_TEXT_DEFAULT
     content_selector: str | None = None
     remove_selectors: list[str] = Field(default_factory=list)
 
@@ -287,6 +296,34 @@ def select_proxy(request_proxy: str | None) -> str | None:
     return proxy or SCRAPLING_PROXY
 
 
+def decode_body(body: bytes) -> str:
+    detected = from_bytes(body).best()
+    if detected is not None:
+        return str(detected)
+
+    return body.decode("utf-8", errors="replace")
+
+
+def normalize_extracted_text(text: str) -> str:
+    text = html_lib.unescape(text)
+    text = fix_text(text)
+    text = unicodedata.normalize("NFC", text)
+
+    normalized_chars = []
+    for char in text:
+        category = unicodedata.category(char)
+        if category == "Zs":
+            normalized_chars.append(" ")
+        elif category == "Cf":
+            continue
+        else:
+            normalized_chars.append(char)
+
+    text = "".join(normalized_chars)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 async def fetch_static(url: str, user_agent: str | None, proxy: str | None):
     page = await AsyncFetcher.get(
         url,
@@ -297,7 +334,7 @@ async def fetch_static(url: str, user_agent: str | None, proxy: str | None):
         proxy=proxy,
     )
 
-    html = page.body.decode("utf-8", errors="ignore")
+    html = decode_body(page.body)
     return page.status, html, "static"
 
 
@@ -389,7 +426,10 @@ async def fetch_dynamic(
     user_agent: str | None,
     proxy: str | None,
 ):
+    visible_text = None
+
     async def interact_with_page(page):
+        nonlocal visible_text
         filled = await fill_input_values(page, input_values)
         clicked = 0
 
@@ -406,6 +446,11 @@ async def fetch_dynamic(
             await page.wait_for_timeout(wait_after_actions)
         elif clicked or filled:
             await page.wait_for_timeout(AUTO_EXPAND_AFTER_CLICK_WAIT)
+
+        try:
+            visible_text = await page.locator("body").inner_text()
+        except Exception:
+            visible_text = None
 
     try:
         await asyncio.wait_for(
@@ -439,8 +484,8 @@ async def fetch_dynamic(
     finally:
         dynamic_semaphore.release()
 
-    html = page.body.decode("utf-8", errors="ignore")
-    return page.status, html, "dynamic"
+    html = decode_body(page.body)
+    return page.status, html, "dynamic", visible_text
 
 
 def should_use_dynamic(html: str) -> bool:
@@ -526,7 +571,20 @@ def clean_html_for_markdown(
     return str(content_root)
 
 
-def distill_markdown(markdown: str) -> str:
+def html_to_visible_text(
+    html: str,
+    content_selector: str | None,
+    remove_selectors: list[str],
+) -> str:
+    cleaned_html = clean_html_for_markdown(html, content_selector, remove_selectors)
+    soup = BeautifulSoup(cleaned_html, "html.parser")
+    return soup.get_text("\n", strip=True)
+
+
+def distill_markdown(markdown: str, normalize_text: bool) -> str:
+    if normalize_text:
+        markdown = normalize_extracted_text(markdown)
+
     markdown = "\n".join(line.rstrip() for line in markdown.splitlines())
     markdown = re.sub(r"\n{3,}", "\n\n", markdown)
     return markdown.strip()
@@ -540,6 +598,7 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
     url = str(req.url)
     mode = req.mode.lower()
     response_format = req.response_format.lower()
+    extract_source = req.extract_source.lower()
     input_values = {
         selector.strip(): value
         for selector, value in req.input_values.items()
@@ -569,6 +628,9 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
 
     if response_format not in {"json", "markdown"}:
         raise HTTPException(status_code=400, detail="Invalid response_format")
+
+    if extract_source not in {"html", "visible_text"}:
+        raise HTTPException(status_code=400, detail="Invalid extract_source")
 
     if len(input_values) > MAX_INPUT_SELECTORS:
         raise HTTPException(
@@ -618,7 +680,7 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
         selected_proxy = select_proxy(req.proxy)
 
         if mode == "dynamic":
-            status, html, used_mode = await fetch_dynamic(
+            status, html, used_mode, visible_text = await fetch_dynamic(
                 url,
                 req.auto_expand,
                 input_values,
@@ -634,11 +696,12 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
                 selected_user_agent,
                 selected_proxy,
             )
+            visible_text = None
 
             if mode == "auto" and (
                 should_use_dynamic(html) or needs_dynamic_interaction
             ):
-                status, html, used_mode = await fetch_dynamic(
+                status, html, used_mode, visible_text = await fetch_dynamic(
                     url,
                     req.auto_expand,
                     input_values,
@@ -649,15 +712,21 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
                     selected_proxy,
                 )
 
-        markdown_html = html
-        if req.clean_content:
-            markdown_html = clean_html_for_markdown(
-                html,
-                req.content_selector,
-                remove_selectors,
-            )
+        if extract_source == "visible_text":
+            text = visible_text
+            if text is None:
+                text = html_to_visible_text(html, req.content_selector, remove_selectors)
+            markdown = distill_markdown(text, req.normalize_text)
+        else:
+            markdown_html = html
+            if req.clean_content:
+                markdown_html = clean_html_for_markdown(
+                    html,
+                    req.content_selector,
+                    remove_selectors,
+                )
 
-        markdown = distill_markdown(md(markdown_html))
+            markdown = distill_markdown(md(markdown_html), req.normalize_text)
 
         if response_format == "markdown":
             return PlainTextResponse(
@@ -670,6 +739,7 @@ async def scrape(req: ScrapeRequest, x_api_key: str = Header(default="")):
             "url": url,
             "status": status,
             "mode": used_mode,
+            "extract_source": extract_source,
             "proxy_enabled": selected_proxy is not None,
             "markdown": markdown,
         }

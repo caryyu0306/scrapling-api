@@ -17,6 +17,7 @@ https://scrapling.readthedocs.io/en/latest/index.html
 - **表單互動**：支援在 dynamic 模式先填入 input / textarea，再點擊按鈕並等待結果
 - **點擊模擬**：支援在抓取前執行手動指定的 CSS Selector 點擊操作
 - **內容清理與降噪**：Markdownify 前先移除 Nav、Footer、Aside、廣告、Cookie 橫幅等噪音節點
+- **文字正規化**：自動偵測 HTML bytes 編碼，並修復 HTML entities、Unicode 空白、零寬字元與常見 mojibake
 - **主體萃取**：可自動挑選 `article` / `main` / `[role=main]` 等主體內容，也可手動指定 `content_selector`
 - **併發保護**：使用 Semaphore 限制同時執行的 DynamicFetcher 數量，避免瀏覽器併發拖垮 Docker 主機
 - **User-Agent 輪換**：每次 `/scrape` 請求自動挑選 User-Agent，且 `auto` fallback 會沿用同一個 UA
@@ -73,7 +74,7 @@ FastAPI
                   +-- 改用 DynamicFetcher
     |
     v
-HTML -> Clean HTML -> Markdown -> Distilled Markdown -> JSON 或 Markdown 回應
+HTML -> Clean HTML -> Markdown -> Normalized Markdown -> JSON 或 Markdown 回應
 ```
 
 ## 專案檔案
@@ -95,7 +96,14 @@ FROM pyd4vinci/scrapling
 
 WORKDIR /service
 
-RUN python -m pip install --no-cache-dir "scrapling[all]" fastapi "uvicorn[standard]" markdownify beautifulsoup4
+RUN python -m pip install --no-cache-dir \
+    "scrapling[all]" \
+    fastapi \
+    "uvicorn[standard]" \
+    markdownify \
+    beautifulsoup4 \
+    charset-normalizer \
+    ftfy
 
 COPY main.py .
 
@@ -227,6 +235,7 @@ http://localhost:8080/docs
 | `FORM_ACTION_TIMEOUT` | `15000` | 毫秒 | 填表單或等待 `wait_for_selector` 時，每個 selector 最長等待時間 |
 | `MAX_WAIT_AFTER_ACTIONS` | `60000` | 毫秒 | 單次請求允許 `wait_after_actions` 等待的最大時間 |
 | `CLEAN_CONTENT_DEFAULT` | `true` | 布林值 | 是否預設在 Markdownify 前清理 HTML |
+| `NORMALIZE_TEXT_DEFAULT` | `true` | 布林值 | 是否預設在 Markdown 產出後執行通用文字正規化 |
 | `CONTENT_SELECTORS` | (內建列表) | - | 自動挑選主體內容的 CSS Selector 候選，以 `\|` 分隔 |
 | `CONTENT_MIN_TEXT_LENGTH` | `200` | 字元 | 主體候選節點至少要有多少文字才會被採用 |
 | `REMOVE_TAGS` | (內建列表) | - | Markdownify 前一律刪除的 HTML tags，以 `\|` 分隔 |
@@ -261,6 +270,7 @@ JSON Body：
 | `url` | 是 | 無 | HTTP 或 HTTPS URL | 要抓取的目標網址 |
 | `mode` | 否 | `auto` | `auto`, `static`, `dynamic` | 抓取模式 |
 | `response_format` | 否 | `json` | `json`, `markdown` | 回應格式 |
+| `extract_source` | 否 | `html` | `html`, `visible_text` | 轉換來源；`html` 保留 Markdown 結構，`visible_text` 使用瀏覽器/HTML 可見文字 |
 | `proxy` | 否 | `null` | Proxy URL | 單次請求使用的 proxy；有填時優先於 `.env` 的 `SCRAPLING_PROXY`，沒填時使用 `SCRAPLING_PROXY` 或直連 |
 | `auto_expand` | 否 | `true` | 布林值 | 針對此請求是否執行自動展開 (僅動態模式有效) |
 | `input_values` | 否 | `{}` | Dict[str, str] | dynamic 模式中要填入的表單欄位，key 為 CSS Selector，value 為填入內容 |
@@ -268,6 +278,7 @@ JSON Body：
 | `wait_for_selector` | 否 | `null` | CSS Selector | 執行表單填寫與點擊後，等待指定元素出現再抓 HTML |
 | `wait_after_actions` | 否 | `0` | 毫秒 | 執行表單填寫與點擊後額外等待多久，適合 WebSocket 或非同步結果頁 |
 | `clean_content` | 否 | `true` | 布林值 | 是否在 Markdownify 前執行內容清理與主體萃取 |
+| `normalize_text` | 否 | `true` | 布林值 | 是否在 Markdown 產出後執行通用文字正規化 |
 | `content_selector` | 否 | `null` | CSS Selector | 手動指定要轉 Markdown 的主體節點 |
 | `remove_selectors` | 否 | `[]` | List[str] | 單次請求額外要刪除的 CSS Selectors |
 
@@ -364,7 +375,7 @@ n8n HTTP Request body 可直接使用：
 預設清理流程：
 
 1. 移除註解、`script`、`style`、`nav`、`footer`、`aside`、`iframe`、表單與按鈕等節點。
-2. 移除常見噪音 selector，例如 `.ads`、`.cookie-banner`、`.sidebar`、`.social-share`、`.related-posts`。
+2. 移除常見噪音 selector，例如 hidden/aria-hidden 節點、`.ads`、`.cookie-banner`、`.sidebar`、`.social-share`、`.related-posts`。
 3. 從 `article`、`main`、`[role='main']`、`.entry-content` 等候選節點中挑出文字量最多的主體內容。
 4. 將清理後的 HTML 轉成 Markdown，並壓縮多餘空白行。
 
@@ -380,6 +391,46 @@ n8n HTTP Request body 可直接使用：
 ```
 
 如果特殊網站需要完整原始 HTML 轉 Markdown，可傳入 `"clean_content": false` 關閉清理。
+
+### 可視文字抽取
+
+預設 `extract_source: "html"` 會把清理後的 HTML 交給 Markdownify，適合一般文章，能保留標題、連結與清單結構。
+
+少數 JavaScript-heavy 網站會在 DOM 內放入大量 framework data、隱藏節點或範例片段，導致 Markdownify 抽到不是畫面主體的內容。這類頁面可改用 `extract_source: "visible_text"`：
+
+```json
+{
+  "url": "https://my.f5.com/manage/s/article/K02024845",
+  "mode": "dynamic",
+  "extract_source": "visible_text",
+  "response_format": "markdown"
+}
+```
+
+在 `dynamic` 模式下，`visible_text` 會優先使用瀏覽器載入與互動完成後的 `body.innerText`；在 `static` 模式或瀏覽器文字不可用時，會從清理後 HTML 取純文字。這個模式不會保留完整 Markdown 結構，但能避開隱藏 DOM、Salesforce/Aura 類 framework data 造成的錯誤抽取。
+
+## 文字正規化
+
+服務會先用 `charset-normalizer` 從原始 response bytes 偵測編碼，再轉成文字，避免固定假設 UTF-8 造成部分老網站或 CMS 內容亂碼。
+
+Markdown 產出後，預設會執行 `normalize_text`：
+
+1. 使用 `html.unescape()` 還原 HTML entities。
+2. 使用 `ftfy.fix_text()` 修復常見 mojibake。
+3. 使用 Unicode `NFC` 正規化，保留中文語意字元。
+4. 將 Unicode separator space 類別轉成一般空白。
+5. 移除 zero-width / format control 字元。
+6. 壓縮多餘空白行，同時保留行內空白與程式碼縮排。
+
+這個流程不會針對任何固定中文字做替換，因此不會把正常中文句子中的特定字誤刪。若特殊場景需要保留原始 Markdown 文字，可在請求中傳入：
+
+```json
+{
+  "url": "https://example.com",
+  "normalize_text": false,
+  "response_format": "markdown"
+}
+```
 
 ## Dynamic 併發與排隊控制
 
